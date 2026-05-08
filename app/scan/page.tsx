@@ -34,6 +34,7 @@ export default function ScanPage() {
   const [cameraError, setCameraError] = useState('')
   const [manualBarcode, setManualBarcode] = useState('')
   const [searching, setSearching] = useState(false)
+  const [lastSearched, setLastSearched] = useState('')
   const router = useRouter()
   const supabase = createClient()
 
@@ -151,23 +152,67 @@ export default function ScanPage() {
   const fetchProduct = async (barcode: string) => {
     setNotFound(false)
     setProduct(null)
-    const { data } = await supabase
+
+    // ลบ whitespace และ trim ให้สะอาด
+    const cleaned = barcode.trim().replace(/\s/g, '')
+    setLastSearched(cleaned)
+
+    console.log('🔍 ค้นหา barcode:', JSON.stringify(cleaned))
+
+    // ลองค้นหาแบบ text ก่อน
+    const { data, error } = await supabase
       .from('products')
       .select('*')
-      .eq('barcode', barcode)
+      .eq('barcode', cleaned)
       .single()
+
+    console.log('📦 result:', data, '❌ error:', error)
 
     if (data) {
       setProduct(data)
       setQuantity(1)
-    } else {
-      setNotFound(true)
+      return
     }
+
+    // ถ้าไม่เจอ ลองค้นหาแบบ number (กรณี column เป็น bigint)
+    const asNumber = Number(cleaned)
+    if (!isNaN(asNumber)) {
+      const { data: data2 } = await supabase
+        .from('products')
+        .select('*')
+        .eq('barcode', asNumber)
+        .single()
+
+      console.log('📦 result (number):', data2)
+
+      if (data2) {
+        setProduct(data2)
+        setQuantity(1)
+        return
+      }
+    }
+
+    // ถ้ายังไม่เจอ ลอง ilike เผื่อมี space หรือ zero-padding ใน DB
+    const { data: data3 } = await supabase
+      .from('products')
+      .select('*')
+      .ilike('barcode', cleaned)
+      .limit(1)
+      .single()
+
+    console.log('📦 result (ilike):', data3)
+
+    if (data3) {
+      setProduct(data3)
+      setQuantity(1)
+      return
+    }
+
+    setNotFound(true)
   }
 
-  // ค้นหาด้วย manual input
   const handleManualSearch = async () => {
-    const trimmed = manualBarcode.trim()
+    const trimmed = manualBarcode.trim().replace(/\s/g, '')
     if (!trimmed) return
     setSearching(true)
     stopCamera()
@@ -215,6 +260,7 @@ export default function ScanPage() {
     setSuccessMsg('')
     setCameraError('')
     setManualBarcode('')
+    setLastSearched('')
     setQuantity(1)
     setTimeout(() => setScanning(true), 300)
   }
@@ -302,13 +348,14 @@ export default function ScanPage() {
               </>
             )}
 
-            {/* Manual barcode input — แสดงอยู่ใต้กล้องเสมอ */}
+            {/* Manual Search */}
             <div className="px-4 pb-4">
               <div className="flex items-center gap-2">
                 <div className="relative flex-1">
                   <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 text-lg">🔍</span>
                   <input
                     type="text"
+                    inputMode="numeric"
                     value={manualBarcode}
                     onChange={e => setManualBarcode(e.target.value)}
                     onKeyDown={handleManualKeyDown}
@@ -330,15 +377,20 @@ export default function ScanPage() {
 
         {/* Not Found */}
         {notFound && (
-          <div className="bg-white rounded-2xl shadow p-6 text-center">
-            <p className="text-4xl mb-2">❌</p>
-            <p className="text-gray-700 font-medium">ไม่พบบาร์โค้ด <span className="text-blue-600 font-mono">{manualBarcode || ''}</span> ในระบบ</p>
-            <button
-              onClick={handleReset}
-              className="mt-4 bg-blue-600 text-white px-6 py-2 rounded-xl hover:bg-blue-700 transition"
-            >
-              สแกนใหม่
-            </button>
+          <div className="bg-white rounded-2xl shadow p-6 text-center space-y-2">
+            <p className="text-4xl">❌</p>
+            <p className="text-gray-700 font-medium">ไม่พบสินค้าในระบบ</p>
+            <p className="text-gray-400 text-sm font-mono bg-gray-50 rounded-lg px-3 py-1 inline-block">
+              {lastSearched}
+            </p>
+            <div className="pt-2">
+              <button
+                onClick={handleReset}
+                className="bg-blue-600 text-white px-6 py-2 rounded-xl hover:bg-blue-700 transition"
+              >
+                สแกนใหม่
+              </button>
+            </div>
           </div>
         )}
 
