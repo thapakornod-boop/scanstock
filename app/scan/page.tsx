@@ -32,6 +32,8 @@ export default function ScanPage() {
   const [successMsg, setSuccessMsg] = useState('')
   const [userName, setUserName] = useState('')
   const [cameraError, setCameraError] = useState('')
+  const [manualBarcode, setManualBarcode] = useState('')
+  const [searching, setSearching] = useState(false)
   const router = useRouter()
   const supabase = createClient()
 
@@ -97,7 +99,6 @@ export default function ScanPage() {
         const codeReader = new BrowserMultiFormatReader()
         readerRef.current = codeReader
 
-        // version 0.23.0 ใช้ decodeFromStream
         const decodeLoop = async () => {
           while (!cancelled) {
             try {
@@ -113,13 +114,8 @@ export default function ScanPage() {
               }
               break
             } catch (err: any) {
-              if (err instanceof NotFoundException) {
-                // ยังไม่เจอบาร์โค้ด — loop ต่อ
-                continue
-              }
-              if (!cancelled) {
-                console.error('Decode error:', err)
-              }
+              if (err instanceof NotFoundException) continue
+              if (!cancelled) console.error('Decode error:', err)
               break
             }
           }
@@ -169,6 +165,21 @@ export default function ScanPage() {
     }
   }
 
+  // ค้นหาด้วย manual input
+  const handleManualSearch = async () => {
+    const trimmed = manualBarcode.trim()
+    if (!trimmed) return
+    setSearching(true)
+    stopCamera()
+    setScanning(false)
+    await fetchProduct(trimmed)
+    setSearching(false)
+  }
+
+  const handleManualKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter') handleManualSearch()
+  }
+
   const handleSave = async () => {
     if (!product) return
     setSaving(true)
@@ -203,6 +214,7 @@ export default function ScanPage() {
     setNotFound(false)
     setSuccessMsg('')
     setCameraError('')
+    setManualBarcode('')
     setQuantity(1)
     setTimeout(() => setScanning(true), 300)
   }
@@ -289,6 +301,30 @@ export default function ScanPage() {
                 </p>
               </>
             )}
+
+            {/* Manual barcode input — แสดงอยู่ใต้กล้องเสมอ */}
+            <div className="px-4 pb-4">
+              <div className="flex items-center gap-2">
+                <div className="relative flex-1">
+                  <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 text-lg">🔍</span>
+                  <input
+                    type="text"
+                    value={manualBarcode}
+                    onChange={e => setManualBarcode(e.target.value)}
+                    onKeyDown={handleManualKeyDown}
+                    placeholder="พิมพ์บาร์โค้ดแล้วกด Enter"
+                    className="w-full pl-9 pr-3 py-2.5 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-400"
+                  />
+                </div>
+                <button
+                  onClick={handleManualSearch}
+                  disabled={searching || !manualBarcode.trim()}
+                  className="bg-blue-600 text-white px-4 py-2.5 rounded-xl text-sm font-medium hover:bg-blue-700 disabled:opacity-40 transition whitespace-nowrap"
+                >
+                  {searching ? '...' : 'ค้นหา'}
+                </button>
+              </div>
+            </div>
           </div>
         )}
 
@@ -296,7 +332,7 @@ export default function ScanPage() {
         {notFound && (
           <div className="bg-white rounded-2xl shadow p-6 text-center">
             <p className="text-4xl mb-2">❌</p>
-            <p className="text-gray-700 font-medium">ไม่พบสินค้านี้ในระบบ</p>
+            <p className="text-gray-700 font-medium">ไม่พบบาร์โค้ด <span className="text-blue-600 font-mono">{manualBarcode || ''}</span> ในระบบ</p>
             <button
               onClick={handleReset}
               className="mt-4 bg-blue-600 text-white px-6 py-2 rounded-xl hover:bg-blue-700 transition"
