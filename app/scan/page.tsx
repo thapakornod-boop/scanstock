@@ -45,13 +45,6 @@ type ScanLog = {
   created_at: string
 }
 
-// ✅ ตรวจสอบว่าเป็น WebView (LINE, Facebook, etc.)
-function isWebView(): boolean {
-  if (typeof window === 'undefined') return false
-  const ua = navigator.userAgent
-  return /Line\/|FBAN|FBAV|Instagram|MicroMessenger|WebView|(iPhone|iPod|iPad)(?!.*Safari)|Android.*(wv|\.0\.0\.0)/.test(ua)
-}
-
 export default function ScanPage() {
   const videoRef = useRef<HTMLVideoElement>(null)
   const streamRef = useRef<MediaStream | null>(null)
@@ -69,7 +62,6 @@ export default function ScanPage() {
   const [manualBarcode, setManualBarcode] = useState('')
   const [searching, setSearching] = useState(false)
   const [lastSearched, setLastSearched] = useState('')
-  const [isLineWebView, setIsLineWebView] = useState(false)
 
   const [logs, setLogs] = useState<ScanLog[]>([])
   const [loadingLogs, setLoadingLogs] = useState(false)
@@ -81,7 +73,6 @@ export default function ScanPage() {
   const supabase = createClient()
 
   useEffect(() => {
-    setIsLineWebView(isWebView())
     supabase.auth.getUser().then(({ data }) => {
       if (!data.user) { router.push('/'); return }
       setUserEmail(data.user.email || '')
@@ -110,7 +101,7 @@ export default function ScanPage() {
   }, [])
 
   useEffect(() => {
-    if (!scanning || isLineWebView) return
+    if (!scanning) return
     setCameraError('')
     let cancelled = false
 
@@ -167,16 +158,7 @@ export default function ScanPage() {
 
     startCamera()
     return () => { cancelled = true; stopCamera() }
-  }, [scanning, stopCamera, isLineWebView])
-
-  const openInBrowser = () => {
-    const url = window.location.href
-    // สำหรับ Android LINE → intent URL
-    const intentUrl = `intent://${url.replace(/^https?:\/\//, '')}#Intent;scheme=https;package=com.android.chrome;end`
-    window.location.href = intentUrl
-    // fallback
-    setTimeout(() => { window.open(url, '_blank') }, 500)
-  }
+  }, [scanning, stopCamera])
 
   const fetchByBarcode = async (barcode: string) => {
     setNotFound(false)
@@ -330,25 +312,8 @@ export default function ScanPage() {
         {/* ===== TAB: SCAN ===== */}
         {tab === 'scan' && (
           <>
-            {/* ✅ LINE WebView Warning */}
-            {isLineWebView && (
-              <div className="bg-yellow-50 border border-yellow-200 rounded-2xl p-5 text-center space-y-3">
-                <p className="text-4xl">⚠️</p>
-                <p className="text-gray-700 font-semibold text-base">ไม่สามารถใช้กล้องใน LINE ได้</p>
-                <p className="text-gray-500 text-sm leading-relaxed">
-                  LINE browser ไม่รองรับการใช้กล้องสแกนบาร์โค้ด<br />
-                  กรุณาเปิดใน Chrome เพื่อใช้งาน
-                </p>
-                <button onClick={openInBrowser}
-                  className="w-full bg-blue-600 text-white py-3 rounded-xl font-semibold hover:bg-blue-700 transition text-sm">
-                  เปิดใน Chrome
-                </button>
-                <p className="text-gray-400 text-xs">หรือ copy ลิงค์ไปเปิดใน Chrome เอง</p>
-              </div>
-            )}
-
             {/* Camera */}
-            {!isLineWebView && scanning && (
+            {scanning && (
               <div className="bg-white rounded-2xl shadow-sm border border-gray-100 overflow-hidden">
                 {cameraError === 'permission_denied' ? (
                   <div className="p-6 text-center space-y-3">
@@ -382,7 +347,6 @@ export default function ScanPage() {
                 ) : (
                   <div className="relative bg-black">
                     <video ref={videoRef} className="w-full aspect-[4/3] object-cover" playsInline muted autoPlay />
-                    {/* Overlay */}
                     <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
                       <div className="relative w-56 h-40">
                         <div className="absolute inset-0 border-2 border-white/20 rounded-xl" />
@@ -432,7 +396,6 @@ export default function ScanPage() {
             {/* Form กรอกข้อมูล */}
             {currentEntry && (
               <div className="bg-white rounded-2xl border border-gray-100 overflow-hidden">
-                {/* Product Header */}
                 <div className="px-4 py-3 border-b border-gray-50 flex items-start justify-between gap-2">
                   <div className="flex-1 min-w-0">
                     <p className="text-gray-800 font-semibold text-sm leading-snug truncate">{currentEntry.priceItem.item_name}</p>
@@ -448,7 +411,6 @@ export default function ScanPage() {
                 </div>
 
                 <div className="p-4 space-y-3">
-                  {/* in/out */}
                   <div className="flex rounded-xl overflow-hidden border border-gray-200 h-11">
                     <button onClick={() => setCurrentEntry(e => e ? { ...e, action: 'out' } : e)}
                       className={`flex-1 text-sm font-medium transition ${currentEntry.action === 'out' ? 'bg-red-500 text-white' : 'text-gray-400'}`}>
@@ -460,7 +422,6 @@ export default function ScanPage() {
                     </button>
                   </div>
 
-                  {/* Quantity + Unit */}
                   <div className="flex items-center gap-2">
                     <button onClick={() => setCurrentEntry(e => e ? { ...e, quantity: Math.max(1, e.quantity - 1) } : e)}
                       className="w-11 h-11 bg-gray-100 rounded-xl text-xl font-bold hover:bg-gray-200 active:scale-95 transition flex items-center justify-center">
@@ -480,12 +441,10 @@ export default function ScanPage() {
                     </select>
                   </div>
 
-                  {/* Note */}
                   <input type="text" placeholder="หมายเหตุ (ถ้ามี)" value={currentEntry.note}
                     onChange={ev => setCurrentEntry(e => e ? { ...e, note: ev.target.value } : e)}
                     className="w-full border border-gray-200 rounded-xl px-4 h-11 text-sm focus:outline-none focus:ring-2 focus:ring-blue-400 bg-gray-50" />
 
-                  {/* Buttons */}
                   <div className="flex gap-2 pt-1">
                     <button onClick={handleAddEntry}
                       className="flex-1 bg-blue-600 text-white h-12 rounded-xl font-semibold text-sm hover:bg-blue-700 active:scale-98 transition">
@@ -577,7 +536,6 @@ export default function ScanPage() {
         {/* ===== TAB: MANAGE ===== */}
         {tab === 'manage' && (
           <>
-            {/* Download */}
             <div className="bg-white rounded-2xl border border-gray-100 overflow-hidden">
               <div className="px-4 py-3 border-b border-gray-50">
                 <p className="font-semibold text-sm text-gray-700">⬇️ Download ข้อมูล</p>
@@ -602,7 +560,6 @@ export default function ScanPage() {
               </div>
             </div>
 
-            {/* All Logs */}
             <div className="bg-white rounded-2xl border border-gray-100 overflow-hidden">
               <div className="px-4 py-3 border-b border-gray-50">
                 <p className="font-semibold text-sm text-gray-700">รายการทั้งหมด</p>
