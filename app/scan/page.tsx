@@ -6,17 +6,34 @@ import { createClient } from '@/lib/supabase'
 import { useRouter } from 'next/navigation'
 import Image from 'next/image'
 
+type BarcodeType = 'piece' | 'case' | 'pack'
+
+type PriceItem = {
+  id: string
+  item_code: string
+  item_name: string
+  brand: string
+  barcode_piece: string
+  barcode_case: string
+  barcode_pack: string
+  num_in_buy: number
+  size: string
+}
+
 type Product = {
   id: string
   item_code: string
   item_name: string
   barcode: string
-  brand: string
-  uom: number
-  stock_value: number
   on_hand: number
-  in_stock_cases: number
-  in_stock_pieces: number
+  stock_value: number
+  uom: number
+}
+
+type ScanResult = {
+  priceItem: PriceItem
+  barcodeType: BarcodeType
+  product: Product | null  // มีเฉพาะ barcode_piece
 }
 
 export default function ScanPage() {
@@ -24,7 +41,7 @@ export default function ScanPage() {
   const streamRef = useRef<MediaStream | null>(null)
   const readerRef = useRef<BrowserMultiFormatReader | null>(null)
   const [scanning, setScanning] = useState(true)
-  const [product, setProduct] = useState<Product | null>(null)
+  const [scanResult, setScanResult] = useState<ScanResult | null>(null)
   const [notFound, setNotFound] = useState(false)
   const [quantity, setQuantity] = useState(1)
   const [action, setAction] = useState<'in' | 'out'>('out')
@@ -62,7 +79,6 @@ export default function ScanPage() {
 
   useEffect(() => {
     if (!scanning) return
-
     setCameraError('')
     let cancelled = false
 
@@ -73,19 +89,10 @@ export default function ScanPage() {
         if (cancelled) return
 
         const stream = await navigator.mediaDevices.getUserMedia({
-          video: {
-            facingMode: { ideal: 'environment' },
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
-          },
+          video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
           audio: false,
         })
-
-        if (cancelled) {
-          stream.getTracks().forEach(t => t.stop())
-          return
-        }
-
+        if (cancelled) { stream.getTracks().forEach(t => t.stop()); return }
         streamRef.current = stream
 
         if (videoRef.current) {
@@ -94,7 +101,6 @@ export default function ScanPage() {
           videoRef.current.muted = true
           await videoRef.current.play()
         }
-
         if (cancelled) return
 
         const codeReader = new BrowserMultiFormatReader()
@@ -103,112 +109,76 @@ export default function ScanPage() {
         const decodeLoop = async () => {
           while (!cancelled) {
             try {
-              const result = await codeReader.decodeOnceFromStream(
-                streamRef.current!,
-                videoRef.current!
-              )
+              const result = await codeReader.decodeOnceFromStream(streamRef.current!, videoRef.current!)
               if (!cancelled) {
                 cancelled = true
                 stopCamera()
                 setScanning(false)
-                fetchProduct(result.getText())
+                fetchByBarcode(result.getText())
               }
               break
             } catch (err: any) {
               if (err instanceof NotFoundException) continue
-              if (!cancelled) console.error('Decode error:', err)
               break
             }
           }
         }
-
         decodeLoop()
-
       } catch (err: any) {
         if (cancelled) return
-        console.error('Camera error:', err)
         stopCamera()
-
-        if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-          setCameraError('ไม่ได้รับอนุญาตให้ใช้กล้อง\nกรุณาอนุญาตในการตั้งค่าเบราว์เซอร์แล้วโหลดหน้าใหม่')
-        } else if (err.name === 'NotReadableError' || err.name === 'TrackStartError') {
-          setCameraError('กล้องถูกใช้งานโดยแอปอื่นอยู่\nกรุณาปิดแอปอื่น (เช่น กล้อง, LINE) แล้วลองใหม่')
-        } else if (err.name === 'NotFoundError') {
-          setCameraError('ไม่พบกล้องในอุปกรณ์นี้')
+        if (err.name === 'NotAllowedError') {
+          setCameraError('ไม่ได้รับอนุญาตให้ใช้กล้อง\nกรุณาอนุญาตในการตั้งค่าเบราว์เซอร์')
+        } else if (err.name === 'NotReadableError') {
+          setCameraError('กล้องถูกใช้งานโดยแอปอื่นอยู่\nกรุณาปิดแอปอื่นแล้วลองใหม่')
         } else {
-          setCameraError(`เกิดข้อผิดพลาด: ${err.name}\nกรุณาลองใหม่อีกครั้ง`)
+          setCameraError(`เกิดข้อผิดพลาด: ${err.name}`)
         }
       }
     }
 
     startCamera()
-
-    return () => {
-      cancelled = true
-      stopCamera()
-    }
+    return () => { cancelled = true; stopCamera() }
   }, [scanning, stopCamera])
 
-  const fetchProduct = async (barcode: string) => {
+  // ✅ ค้นหาจาก pricelist ก่อน แล้วค่อย join products
+  const fetchByBarcode = async (barcode: string) => {
     setNotFound(false)
-    setProduct(null)
-
-    // ลบ whitespace และ trim ให้สะอาด
+    setScanResult(null)
     const cleaned = barcode.trim().replace(/\s/g, '')
     setLastSearched(cleaned)
 
-    console.log('🔍 ค้นหา barcode:', JSON.stringify(cleaned))
-
-    // ลองค้นหาแบบ text ก่อน
-    const { data, error } = await supabase
-      .from('products')
+    // ค้นหาใน pricelist ทั้ง 3 column
+    const { data } = await supabase
+      .from('pricelist')
       .select('*')
-      .eq('barcode', cleaned)
-      .single()
-
-    console.log('📦 result:', data, '❌ error:', error)
-
-    if (data) {
-      setProduct(data)
-      setQuantity(1)
-      return
-    }
-
-    // ถ้าไม่เจอ ลองค้นหาแบบ number (กรณี column เป็น bigint)
-    const asNumber = Number(cleaned)
-    if (!isNaN(asNumber)) {
-      const { data: data2 } = await supabase
-        .from('products')
-        .select('*')
-        .eq('barcode', asNumber)
-        .single()
-
-      console.log('📦 result (number):', data2)
-
-      if (data2) {
-        setProduct(data2)
-        setQuantity(1)
-        return
-      }
-    }
-
-    // ถ้ายังไม่เจอ ลอง ilike เผื่อมี space หรือ zero-padding ใน DB
-    const { data: data3 } = await supabase
-      .from('products')
-      .select('*')
-      .ilike('barcode', cleaned)
+      .or(`barcode_piece.eq.${cleaned},barcode_case.eq.${cleaned},barcode_pack.eq.${cleaned}`)
       .limit(1)
       .single()
 
-    console.log('📦 result (ilike):', data3)
-
-    if (data3) {
-      setProduct(data3)
-      setQuantity(1)
+    if (!data) {
+      setNotFound(true)
       return
     }
 
-    setNotFound(true)
+    // ระบุว่าสแกนได้ barcode ประเภทไหน
+    let barcodeType: BarcodeType = 'piece'
+    if (data.barcode_case === cleaned) barcodeType = 'case'
+    else if (data.barcode_pack === cleaned) barcodeType = 'pack'
+
+    // ถ้าเป็น piece → ดึง stock จาก products
+    let product: Product | null = null
+    if (barcodeType === 'piece') {
+      const { data: prod } = await supabase
+        .from('products')
+        .select('id, item_code, item_name, barcode, on_hand, stock_value, uom')
+        .eq('barcode', cleaned)
+        .single()
+      product = prod
+    }
+
+    setScanResult({ priceItem: data, barcodeType, product })
+    setQuantity(1)
   }
 
   const handleManualSearch = async () => {
@@ -217,23 +187,20 @@ export default function ScanPage() {
     setSearching(true)
     stopCamera()
     setScanning(false)
-    await fetchProduct(trimmed)
+    await fetchByBarcode(trimmed)
     setSearching(false)
   }
 
-  const handleManualKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === 'Enter') handleManualSearch()
-  }
-
   const handleSave = async () => {
-    if (!product) return
+    if (!scanResult?.product) return
     setSaving(true)
     const { data: { user } } = await supabase.auth.getUser()
+    const { product, priceItem } = scanResult
 
     await supabase.from('scan_logs').insert({
       user_id: user?.id,
       barcode: product.barcode,
-      product_name: product.item_name,
+      product_name: priceItem.item_name,
       action,
       quantity,
     })
@@ -247,7 +214,11 @@ export default function ScanPage() {
       .update({ on_hand: newStock, updated_at: new Date().toISOString() })
       .eq('id', product.id)
 
-    setProduct(prev => prev ? { ...prev, on_hand: newStock } : null)
+    setScanResult(prev => prev ? {
+      ...prev,
+      product: prev.product ? { ...prev.product, on_hand: newStock } : null
+    } : null)
+
     setSuccessMsg(`✅ ${action === 'in' ? 'รับเข้า' : 'จ่ายออก'} ${quantity} ชิ้น เรียบร้อย`)
     setSaving(false)
     setTimeout(() => setSuccessMsg(''), 2500)
@@ -255,7 +226,7 @@ export default function ScanPage() {
 
   const handleReset = () => {
     stopCamera()
-    setProduct(null)
+    setScanResult(null)
     setNotFound(false)
     setSuccessMsg('')
     setCameraError('')
@@ -265,17 +236,16 @@ export default function ScanPage() {
     setTimeout(() => setScanning(true), 300)
   }
 
-  const handleRetryCamera = () => {
-    stopCamera()
-    setCameraError('')
-    setScanning(false)
-    setTimeout(() => setScanning(true), 300)
-  }
-
   const handleLogout = async () => {
     stopCamera()
     await supabase.auth.signOut()
     router.push('/')
+  }
+
+  const barcodeTypeLabel = (type: BarcodeType) => {
+    if (type === 'piece') return { label: 'บาร์โค้ดชิ้น', color: 'bg-blue-100 text-blue-700' }
+    if (type === 'case') return { label: 'บาร์โค้ดลัง', color: 'bg-orange-100 text-orange-700' }
+    return { label: 'บาร์โค้ดแพ็ค', color: 'bg-purple-100 text-purple-700' }
   }
 
   return (
@@ -284,20 +254,10 @@ export default function ScanPage() {
       {/* Header */}
       <div className="bg-white shadow-sm px-4 py-3 flex items-center justify-between">
         <div className="flex items-center gap-3">
-          <Image
-            src="https://i.postimg.cc/RVy6cmjv/RSM-group-logo-outline-1.png"
-            alt="RSM"
-            width={80}
-            height={32}
-            unoptimized
-            className="object-contain"
-          />
+          <Image src="https://i.postimg.cc/RVy6cmjv/RSM-group-logo-outline-1.png" alt="RSM" width={80} height={32} unoptimized className="object-contain" />
           <span className="text-gray-500 text-sm hidden sm:block">{userName}</span>
         </div>
-        <button
-          onClick={handleLogout}
-          className="text-sm text-red-500 hover:text-red-700 transition"
-        >
+        <button onClick={handleLogout} className="text-sm text-red-500 hover:text-red-700 transition">
           ออกจากระบบ
         </button>
       </div>
@@ -310,30 +270,19 @@ export default function ScanPage() {
             <div className="bg-blue-600 px-4 py-3">
               <h2 className="text-white font-semibold text-center">📷 สแกนบาร์โค้ด</h2>
             </div>
-
             {cameraError ? (
               <div className="p-8 text-center space-y-4">
                 <p className="text-5xl">📵</p>
-                <p className="text-gray-700 font-medium leading-relaxed whitespace-pre-line">
-                  {cameraError}
-                </p>
-                <button
-                  onClick={handleRetryCamera}
-                  className="bg-blue-600 text-white px-6 py-2.5 rounded-xl hover:bg-blue-700 transition font-medium"
-                >
+                <p className="text-gray-700 font-medium leading-relaxed whitespace-pre-line">{cameraError}</p>
+                <button onClick={() => { setCameraError(''); setScanning(false); setTimeout(() => setScanning(true), 300) }}
+                  className="bg-blue-600 text-white px-6 py-2.5 rounded-xl hover:bg-blue-700 transition font-medium">
                   ลองใหม่อีกครั้ง
                 </button>
               </div>
             ) : (
               <>
                 <div className="relative bg-black">
-                  <video
-                    ref={videoRef}
-                    className="w-full aspect-video object-cover"
-                    playsInline
-                    muted
-                    autoPlay
-                  />
+                  <video ref={videoRef} className="w-full aspect-video object-cover" playsInline muted autoPlay />
                   <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
                     <div className="w-3/4 h-0.5 bg-red-500 opacity-70 animate-pulse" />
                   </div>
@@ -342,32 +291,23 @@ export default function ScanPage() {
                   <div className="absolute bottom-4 left-4 w-8 h-8 border-b-4 border-l-4 border-blue-400 rounded-bl-lg" />
                   <div className="absolute bottom-4 right-4 w-8 h-8 border-b-4 border-r-4 border-blue-400 rounded-br-lg" />
                 </div>
-                <p className="text-center text-gray-400 text-sm py-3">
-                  จ่อบาร์โค้ดให้ตรงกรอบ
-                </p>
+                <p className="text-center text-gray-400 text-sm py-3">จ่อบาร์โค้ดให้ตรงกรอบ</p>
               </>
             )}
-
-            {/* Manual Search */}
             <div className="px-4 pb-4">
               <div className="flex items-center gap-2">
                 <div className="relative flex-1">
-                  <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 text-lg">🔍</span>
+                  <span className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400">🔍</span>
                   <input
-                    type="text"
-                    inputMode="numeric"
-                    value={manualBarcode}
+                    type="text" inputMode="numeric" value={manualBarcode}
                     onChange={e => setManualBarcode(e.target.value)}
-                    onKeyDown={handleManualKeyDown}
+                    onKeyDown={e => e.key === 'Enter' && handleManualSearch()}
                     placeholder="พิมพ์บาร์โค้ดแล้วกด Enter"
                     className="w-full pl-9 pr-3 py-2.5 border border-gray-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-400"
                   />
                 </div>
-                <button
-                  onClick={handleManualSearch}
-                  disabled={searching || !manualBarcode.trim()}
-                  className="bg-blue-600 text-white px-4 py-2.5 rounded-xl text-sm font-medium hover:bg-blue-700 disabled:opacity-40 transition whitespace-nowrap"
-                >
+                <button onClick={handleManualSearch} disabled={searching || !manualBarcode.trim()}
+                  className="bg-blue-600 text-white px-4 py-2.5 rounded-xl text-sm font-medium hover:bg-blue-700 disabled:opacity-40 transition">
                   {searching ? '...' : 'ค้นหา'}
                 </button>
               </div>
@@ -380,117 +320,111 @@ export default function ScanPage() {
           <div className="bg-white rounded-2xl shadow p-6 text-center space-y-2">
             <p className="text-4xl">❌</p>
             <p className="text-gray-700 font-medium">ไม่พบสินค้าในระบบ</p>
-            <p className="text-gray-400 text-sm font-mono bg-gray-50 rounded-lg px-3 py-1 inline-block">
-              {lastSearched}
-            </p>
+            <p className="text-gray-400 text-sm font-mono bg-gray-50 rounded-lg px-3 py-1 inline-block">{lastSearched}</p>
             <div className="pt-2">
-              <button
-                onClick={handleReset}
-                className="bg-blue-600 text-white px-6 py-2 rounded-xl hover:bg-blue-700 transition"
-              >
+              <button onClick={handleReset} className="bg-blue-600 text-white px-6 py-2 rounded-xl hover:bg-blue-700 transition">
                 สแกนใหม่
               </button>
             </div>
           </div>
         )}
 
-        {/* Product Info */}
-        {product && (
+        {/* Scan Result */}
+        {scanResult && (
           <div className="bg-white rounded-2xl shadow overflow-hidden">
-            <div className="bg-blue-600 px-4 py-3">
+            <div className="bg-blue-600 px-4 py-3 flex items-center justify-between">
               <h2 className="text-white font-semibold">ข้อมูลสินค้า</h2>
+              <span className={`text-xs font-medium px-2 py-1 rounded-full ${barcodeTypeLabel(scanResult.barcodeType).color}`}>
+                {barcodeTypeLabel(scanResult.barcodeType).label}
+              </span>
             </div>
-            <div className="p-4 space-y-2">
-              <p className="text-blue-600 font-semibold text-lg leading-tight">{product.item_name}</p>
+
+            <div className="p-4 space-y-3">
+              <p className="text-blue-600 font-semibold text-lg leading-tight">{scanResult.priceItem.item_name}</p>
+
               <div className="grid grid-cols-2 gap-2 text-sm">
                 <div className="bg-gray-50 rounded-xl p-3">
-                  <p className="text-gray-400 text-xs">รหัส</p>
-                  <p className="font-medium">{product.item_code}</p>
-                </div>
-                <div className="bg-gray-50 rounded-xl p-3">
-                  <p className="text-gray-400 text-xs">บาร์โค้ด</p>
-                  <p className="font-medium">{product.barcode}</p>
-                </div>
-                <div className="bg-gray-50 rounded-xl p-3">
-                  <p className="text-gray-400 text-xs">ราคา</p>
-                  <p className="font-medium">฿{product.stock_value.toLocaleString()}</p>
-                </div>
-                <div className="bg-gray-50 rounded-xl p-3">
-                  <p className="text-gray-400 text-xs">คงเหลือ</p>
-                  <p className={`font-bold text-lg ${product.on_hand <= 10 ? 'text-red-500' : 'text-green-600'}`}>
-                    {product.on_hand} ชิ้น
-                  </p>
-                </div>
-                <div className="bg-gray-50 rounded-xl p-3">
-                  <p className="text-gray-400 text-xs">หน่วย/ลัง</p>
-                  <p className="font-medium">{product.uom} ชิ้น</p>
+                  <p className="text-gray-400 text-xs">รหัสสินค้า</p>
+                  <p className="font-medium">{scanResult.priceItem.item_code}</p>
                 </div>
                 <div className="bg-gray-50 rounded-xl p-3">
                   <p className="text-gray-400 text-xs">แบรนด์</p>
-                  <p className="font-medium">{product.brand}</p>
+                  <p className="font-medium">{scanResult.priceItem.brand}</p>
+                </div>
+                <div className="bg-gray-50 rounded-xl p-3">
+                  <p className="text-gray-400 text-xs">ขนาด</p>
+                  <p className="font-medium">{scanResult.priceItem.size || '-'}</p>
+                </div>
+                <div className="bg-gray-50 rounded-xl p-3">
+                  <p className="text-gray-400 text-xs">หน่วย/ลัง</p>
+                  <p className="font-medium">{scanResult.priceItem.num_in_buy} ชิ้น</p>
                 </div>
               </div>
-            </div>
 
-            <div className="px-4 pb-4 space-y-3">
-              <div className="flex rounded-xl overflow-hidden border border-gray-200">
-                <button
-                  onClick={() => setAction('out')}
-                  className={`flex-1 py-2 text-sm font-medium transition ${
-                    action === 'out' ? 'bg-red-500 text-white' : 'bg-white text-gray-500'
-                  }`}
-                >
-                  จ่ายออก
-                </button>
-                <button
-                  onClick={() => setAction('in')}
-                  className={`flex-1 py-2 text-sm font-medium transition ${
-                    action === 'in' ? 'bg-green-500 text-white' : 'bg-white text-gray-500'
-                  }`}
-                >
-                  รับเข้า
-                </button>
-              </div>
+              {/* ถ้าเป็น barcode ชิ้น → แสดง stock + บันทึกได้ */}
+              {scanResult.barcodeType === 'piece' && scanResult.product && (
+                <>
+                  <div className="bg-blue-50 rounded-xl p-3 flex items-center justify-between">
+                    <div>
+                      <p className="text-gray-400 text-xs">สินค้าคงเหลือปัจจุบัน</p>
+                      <p className={`font-bold text-2xl ${scanResult.product.on_hand <= 10 ? 'text-red-500' : 'text-green-600'}`}>
+                        {scanResult.product.on_hand} ชิ้น
+                      </p>
+                    </div>
+                    <div className="text-right">
+                      <p className="text-gray-400 text-xs">ราคา</p>
+                      <p className="font-semibold text-gray-700">฿{scanResult.product.stock_value.toLocaleString()}</p>
+                    </div>
+                  </div>
 
-              <div className="flex items-center gap-3">
-                <button
-                  onClick={() => setQuantity(q => Math.max(1, q - 1))}
-                  className="w-12 h-12 bg-gray-100 rounded-xl text-xl font-bold hover:bg-gray-200 transition"
-                >
-                  −
-                </button>
-                <input
-                  type="number"
-                  value={quantity}
-                  onChange={e => setQuantity(Math.max(1, parseInt(e.target.value) || 1))}
-                  className="flex-1 text-center text-xl font-bold border border-gray-200 rounded-xl py-2 focus:outline-none focus:ring-2 focus:ring-blue-400"
-                />
-                <button
-                  onClick={() => setQuantity(q => q + 1)}
-                  className="w-12 h-12 bg-gray-100 rounded-xl text-xl font-bold hover:bg-gray-200 transition"
-                >
-                  +
-                </button>
-              </div>
+                  {/* in/out toggle */}
+                  <div className="flex rounded-xl overflow-hidden border border-gray-200">
+                    <button onClick={() => setAction('out')}
+                      className={`flex-1 py-2 text-sm font-medium transition ${action === 'out' ? 'bg-red-500 text-white' : 'bg-white text-gray-500'}`}>
+                      จ่ายออก
+                    </button>
+                    <button onClick={() => setAction('in')}
+                      className={`flex-1 py-2 text-sm font-medium transition ${action === 'in' ? 'bg-green-500 text-white' : 'bg-white text-gray-500'}`}>
+                      รับเข้า
+                    </button>
+                  </div>
 
-              {successMsg && (
-                <div className="bg-green-50 border border-green-200 rounded-xl px-4 py-3 text-center text-green-700 font-medium">
-                  {successMsg}
+                  {/* quantity */}
+                  <div className="flex items-center gap-3">
+                    <button onClick={() => setQuantity(q => Math.max(1, q - 1))}
+                      className="w-12 h-12 bg-gray-100 rounded-xl text-xl font-bold hover:bg-gray-200 transition">−</button>
+                    <input type="number" value={quantity}
+                      onChange={e => setQuantity(Math.max(1, parseInt(e.target.value) || 1))}
+                      className="flex-1 text-center text-xl font-bold border border-gray-200 rounded-xl py-2 focus:outline-none focus:ring-2 focus:ring-blue-400" />
+                    <button onClick={() => setQuantity(q => q + 1)}
+                      className="w-12 h-12 bg-gray-100 rounded-xl text-xl font-bold hover:bg-gray-200 transition">+</button>
+                  </div>
+
+                  {successMsg && (
+                    <div className="bg-green-50 border border-green-200 rounded-xl px-4 py-3 text-center text-green-700 font-medium">
+                      {successMsg}
+                    </div>
+                  )}
+
+                  <button onClick={handleSave} disabled={saving}
+                    className="w-full bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white font-semibold py-3 rounded-xl transition">
+                    {saving ? 'กำลังบันทึก...' : '💾 บันทึก'}
+                  </button>
+                </>
+              )}
+
+              {/* ถ้าเป็น case/pack → แสดงข้อมูลอย่างเดียว ไม่มีปุ่มบันทึก */}
+              {(scanResult.barcodeType === 'case' || scanResult.barcodeType === 'pack') && (
+                <div className="bg-orange-50 border border-orange-200 rounded-xl p-3 text-center">
+                  <p className="text-orange-600 text-sm font-medium">
+                    {scanResult.barcodeType === 'case' ? '📦 บาร์โค้ดลัง' : '🗂 บาร์โค้ดแพ็ค'}
+                  </p>
+                  <p className="text-orange-500 text-xs mt-1">สแกนบาร์โค้ดชิ้นเพื่อแก้ไข stock</p>
                 </div>
               )}
 
-              <button
-                onClick={handleSave}
-                disabled={saving}
-                className="w-full bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white font-semibold py-3 rounded-xl transition"
-              >
-                {saving ? 'กำลังบันทึก...' : '💾 บันทึก'}
-              </button>
-
-              <button
-                onClick={handleReset}
-                className="w-full border border-gray-200 text-gray-500 py-3 rounded-xl hover:bg-gray-50 transition"
-              >
+              <button onClick={handleReset}
+                className="w-full border border-gray-200 text-gray-500 py-3 rounded-xl hover:bg-gray-50 transition">
                 สแกนใหม่
               </button>
             </div>
