@@ -255,16 +255,25 @@ export default function ScanPage() {
     session_label: sessionLabel,
   })
 
-  const handleSaveNow = async () => {
-    if (!currentEntry || !employeeId) return
-    setSavingNow(true)
-    const { error } = await supabase.from('scan_logs').insert([buildRecord(currentEntry)])
-    if (error) { console.error(error); setSavingNow(false); return }
-    setSavingNow(false); setCurrentEntry(null); setNotFound(false); setManualBarcode('')
-    setSuccessMsg('✅ บันทึกสำเร็จ 1 รายการ')
-    setTimeout(() => { setSuccessMsg(''); setScanning(true) }, 1800)
+const handleSaveNow = async () => {
+  if (!currentEntry || !employeeId) return
+  setSavingNow(true)
+  const record = buildRecord(currentEntry)
+  console.log('INSERT record:', JSON.stringify(record, null, 2))
+  const { data, error } = await supabase.from('scan_logs').insert([record]).select()
+  if (error) {
+    console.error('code:', error.code)
+    console.error('message:', error.message)
+    console.error('details:', error.details)
+    console.error('hint:', error.hint)
+    setSavingNow(false)
+    return
   }
-
+  console.log('success:', data)
+  setSavingNow(false); setCurrentEntry(null); setNotFound(false); setManualBarcode('')
+  setSuccessMsg('✅ บันทึกสำเร็จ 1 รายการ')
+  setTimeout(() => { setSuccessMsg(''); setScanning(true) }, 1800)
+}
   const handleAddEntry = () => {
     if (!currentEntry) return
     setEntries(prev => [...prev, currentEntry])
@@ -277,7 +286,7 @@ export default function ScanPage() {
     setSaving(true)
     const records = entries.map(e => buildRecord(e))
     const { error } = await supabase.from('scan_logs').insert(records)
-    if (error) { console.error(error); setSaving(false); return }
+    if (error) { console.error(String(error)); setSaving(false); return }
     setSuccessMsg(`✅ บันทึกสำเร็จ ${records.length} รายการ`)
     setEntries([]); setSaving(false)
     setTimeout(() => setSuccessMsg(''), 3000)
@@ -713,7 +722,7 @@ export default function ScanPage() {
             <Image
               src="https://i.postimg.cc/RVy6cmjv/RSM-group-logo-outline-1.png"
               alt="RSM" width={68} height={26} unoptimized
-              style={{ objectFit: 'contain', filter: isDark ? 'brightness(1.2)' : 'brightness(0.3)', flexShrink: 0 }}
+              style={{ objectFit: 'contain', filter: isDark ? 'brightness(1.2)' : 'none', flexShrink: 0 }}
             />
             {employeeName && (
               <div className="hdr-user-info">
@@ -774,7 +783,11 @@ export default function ScanPage() {
                     <button
                       className="btn btn-primary btn-lg"
                       disabled={!sessionInput.trim()}
-                      onClick={() => { setSessionLabel(sessionInput.trim()); setSessionConfirmed(true) }}
+                     onClick={() => { 
+  setSessionLabel(sessionInput.trim())
+  setSessionConfirmed(true)
+  setScanning(true)        // ← เพิ่มบรรทัดนี้
+}}
                     >
                       ✅ ยืนยันหัวข้อ แล้วเริ่มสแกน
                     </button>
@@ -795,7 +808,7 @@ export default function ScanPage() {
                         setCurrentEntry(null); setNotFound(false); setManualBarcode('')
                         setEntries([])
                       }}
-                    >เปลี่ยน</button>
+                    >เปลี่ยนหัวข้อ</button>
                   </div>
 
                   {/* Camera Card */}
