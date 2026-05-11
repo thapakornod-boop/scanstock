@@ -353,8 +353,8 @@ export default function LoginPage() {
               <input
                 className="inp"
                 type="text"
-                inputMode="numeric"
-                placeholder="เช่น 10042"
+               
+                placeholder="เช่น SDO1004"
                 value={employeeId}
                 onChange={e => setEmployeeId(e.target.value)}
                 onKeyDown={handleKeyDown}
