@@ -32,7 +32,7 @@ export default function LoginPage() {
       .select('employee_id, id_card, name')   // ← ดึง name ด้วย
       .eq('employee_id', trimId)
       .eq('id_card', trimCard)
-      .single()
+      .maybeSingle()
 
     if (dbError || !data) {
       setError('รหัสพนักงานหรือเลขบัตรประชาชนไม่ถูกต้อง')
