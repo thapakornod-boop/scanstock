@@ -1143,13 +1143,10 @@ export default function ScanPage() {
                   </div>
                   <div className="filter-grid">
                     <div>
-                      <div className="filter-label">จากวันที่</div>
-                      <input type="date" className="date-inp" value={dateFrom} onChange={e => setDateFrom(e.target.value)} />
+                
+
                     </div>
-                    <div>
-                      <div className="filter-label">ถึงวันที่</div>
-                      <input type="date" className="date-inp" value={dateTo} onChange={e => setDateTo(e.target.value)} />
-                    </div>
+                  
                   </div>
 
                   {/* Preview count */}
@@ -1176,7 +1173,7 @@ export default function ScanPage() {
                     onClick={handleShare}
                     disabled={sharing || getFilteredLogs().length === 0}
                   >
-                    {sharing ? '⏳ กำลังเตรียมไฟล์...' : ' แชร์ไปยัง LINE / แอปอื่น'}
+                    {sharing ? '⏳ กำลังเตรียมไฟล์...' : '💚 แชร์ไปยัง LINE / แอปอื่น'}
                   </button>
 
                   {/* Share result message */}
