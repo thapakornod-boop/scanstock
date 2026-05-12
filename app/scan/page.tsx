@@ -1176,7 +1176,7 @@ export default function ScanPage() {
                     onClick={handleShare}
                     disabled={sharing || getFilteredLogs().length === 0}
                   >
-                    {sharing ? '⏳ กำลังเตรียมไฟล์...' : '💚 แชร์ไปยัง LINE / แอปอื่น'}
+                    {sharing ? '⏳ กำลังเตรียมไฟล์...' : ' แชร์ไปยัง LINE / แอปอื่น'}
                   </button>
 
                   {/* Share result message */}
