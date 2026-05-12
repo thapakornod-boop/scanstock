@@ -80,6 +80,10 @@ export default function ScanPage() {
   const [filterLabel, setFilterLabel] = useState('')
   const [allLabels, setAllLabels] = useState<string[]>([])
 
+  // ── Share state ──
+  const [sharing, setSharing] = useState(false)
+  const [shareMsg, setShareMsg] = useState('')
+
   const router = useRouter()
   const supabase = createClient()
 
@@ -255,25 +259,22 @@ export default function ScanPage() {
     session_label: sessionLabel,
   })
 
-const handleSaveNow = async () => {
-  if (!currentEntry || !employeeId) return
-  setSavingNow(true)
-  const record = buildRecord(currentEntry)
-  console.log('INSERT record:', JSON.stringify(record, null, 2))
-  const { data, error } = await supabase.from('scan_logs').insert([record]).select()
-  if (error) {
-    console.error('code:', error.code)
-    console.error('message:', error.message)
-    console.error('details:', error.details)
-    console.error('hint:', error.hint)
-    setSavingNow(false)
-    return
+  const handleSaveNow = async () => {
+    if (!currentEntry || !employeeId) return
+    setSavingNow(true)
+    const record = buildRecord(currentEntry)
+    const { data, error } = await supabase.from('scan_logs').insert([record]).select()
+    if (error) {
+      console.error('code:', error.code)
+      console.error('message:', error.message)
+      setSavingNow(false)
+      return
+    }
+    setSavingNow(false); setCurrentEntry(null); setNotFound(false); setManualBarcode('')
+    setSuccessMsg('✅ บันทึกสำเร็จ 1 รายการ')
+    setTimeout(() => { setSuccessMsg(''); setScanning(true) }, 1800)
   }
-  console.log('success:', data)
-  setSavingNow(false); setCurrentEntry(null); setNotFound(false); setManualBarcode('')
-  setSuccessMsg('✅ บันทึกสำเร็จ 1 รายการ')
-  setTimeout(() => { setSuccessMsg(''); setScanning(true) }, 1800)
-}
+
   const handleAddEntry = () => {
     if (!currentEntry) return
     setEntries(prev => [...prev, currentEntry])
@@ -321,19 +322,115 @@ const handleSaveNow = async () => {
     return filtered
   }
 
-  const handleDownload = () => {
-    const filtered = getFilteredLogs()
+  // ── Build CSV blob helper ──
+  const buildCsvBlob = (filtered: ScanLog[]): Blob => {
     const header = 'วันที่,รหัสพนักงาน,ชื่อพนักงาน,หัวข้อ,รหัสสินค้า,ชื่อสินค้า,แบรนด์,ขนาด,จำนวน,หน่วย,หมายเหตุ\n'
     const rows = filtered.map(l =>
       `${new Date(l.created_at).toLocaleString('th-TH')},${l.employee_id},${l.employee_name},${l.session_label || ''},${l.item_code},${l.product_name},${l.brand},${l.size},${l.quantity},${l.unit},${l.note}`
     ).join('\n')
-    const blob = new Blob(['\uFEFF' + header + rows], { type: 'text/csv;charset=utf-8;' })
+    return new Blob(['\uFEFF' + header + rows], { type: 'text/csv;charset=utf-8;' })
+  }
+
+  const buildFileName = () => {
+    const parts = ['scan_logs']
+    if (filterLabel) parts.push(filterLabel.replace(/\s+/g, '_'))
+    if (dateFrom) parts.push(dateFrom)
+    if (dateTo) parts.push(dateTo)
+    return parts.join('_') + '.csv'
+  }
+
+  const handleDownload = () => {
+    const filtered = getFilteredLogs()
+    const blob = buildCsvBlob(filtered)
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = `scan_logs_${filterLabel || 'all'}_${dateFrom || 'all'}_${dateTo || 'all'}.csv`
+    a.download = buildFileName()
     a.click()
     URL.revokeObjectURL(url)
+  }
+
+  // ── Share via Web Share API → LINE ──
+  const handleShare = async () => {
+    const filtered = getFilteredLogs()
+    if (filtered.length === 0) {
+      setShareMsg('⚠️ ไม่มีข้อมูลที่จะแชร์')
+      setTimeout(() => setShareMsg(''), 2500)
+      return
+    }
+
+    setSharing(true)
+    setShareMsg('')
+
+    const blob = buildCsvBlob(filtered)
+    const fileName = buildFileName()
+    const file = new File([blob], fileName, { type: 'text/csv;charset=utf-8;' })
+
+    // ── ลอง Web Share API (รองรับแชร์ไฟล์ + LINE) ──
+    const supportsShare = typeof navigator.share === 'function'
+    const canShareFile  = supportsShare && typeof navigator.canShare === 'function' && navigator.canShare({ files: [file] })
+
+    if (canShareFile) {
+      try {
+        await navigator.share({
+          title: `RSM สแกนสต็อก${filterLabel ? ' – ' + filterLabel : ''}`,
+          text: `ข้อมูลสแกนสต็อก${filterLabel ? ' หัวข้อ: ' + filterLabel : ''}\nจำนวน ${filtered.length} รายการ\nโดย ${employeeName} (${employeeId})`,
+          files: [file],
+        })
+        setShareMsg('✅ แชร์สำเร็จ')
+      } catch (err: any) {
+        if (err?.name !== 'AbortError') {
+          // Share file failed → fallback to text + link
+          await shareTextFallback(filtered, fileName, blob)
+        }
+      }
+    } else if (supportsShare) {
+      // รองรับ share แต่ไม่รองรับไฟล์ → แชร์เป็น text summary แทน
+      await shareTextFallback(filtered, fileName, blob)
+    } else {
+      // ไม่รองรับ Web Share API เลย → download แทน + แจ้ง
+      handleDownload()
+      setShareMsg('ℹ️ เบราว์เซอร์นี้ไม่รองรับการแชร์ — ดาวน์โหลดให้แล้ว')
+    }
+
+    setSharing(false)
+    setTimeout(() => setShareMsg(''), 3000)
+  }
+
+  // fallback: แชร์ข้อความสรุป พร้อม object URL ให้เปิดได้ (เบราว์เซอร์เก่า)
+  const shareTextFallback = async (filtered: ScanLog[], fileName: string, blob: Blob) => {
+    // สร้าง summary text
+    const groups: Record<string, ScanLog[]> = {}
+    filtered.forEach(l => {
+      const k = l.session_label || '(ไม่มีหัวข้อ)'
+      if (!groups[k]) groups[k] = []
+      groups[k].push(l)
+    })
+
+    const summaryLines: string[] = [`📦 RSM สแกนสต็อก — ${employeeName} (${employeeId})`]
+    Object.entries(groups).forEach(([label, items]) => {
+      summaryLines.push(`\n📋 ${label} (${items.length} รายการ)`)
+      items.slice(0, 20).forEach(l => {
+        summaryLines.push(`• ${l.product_name} ${l.quantity} ${l.unit}${l.note ? ' – ' + l.note : ''}`)
+      })
+      if (items.length > 20) summaryLines.push(`  ...และอีก ${items.length - 20} รายการ`)
+    })
+    summaryLines.push('\n(ไฟล์ CSV ดาวน์โหลดแยกต่างหาก)')
+
+    try {
+      await navigator.share({ title: 'RSM สแกนสต็อก', text: summaryLines.join('\n') })
+      // ดาวน์โหลดไฟล์ให้ด้วยโดยอัตโนมัติ
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url; a.download = fileName; a.click()
+      URL.revokeObjectURL(url)
+      setShareMsg('✅ แชร์ข้อความสำเร็จ + ดาวน์โหลดไฟล์ CSV แล้ว')
+    } catch (err: any) {
+      if (err?.name !== 'AbortError') {
+        handleDownload()
+        setShareMsg('ℹ️ ดาวน์โหลดไฟล์ให้แล้ว (เปิดใน LINE ด้วย Files)')
+      }
+    }
   }
 
   const unitOptions = ['ชิ้น', 'ลัง', 'แพ็ค']
@@ -588,6 +685,34 @@ const handleSaveNow = async () => {
         .btn-danger { background: rgba(239,68,68,0.1); color: #f87171; border: 1px solid rgba(239,68,68,0.2); }
         .btn-danger:hover:not(:disabled) { background: rgba(239,68,68,0.18); }
 
+        /* ── Share button (LINE green) ── */
+        .btn-share {
+          background: #06C755;
+          color: #fff;
+          font-size: 15px; padding: 13px 20px; width: 100%;
+        }
+        .btn-share:hover:not(:disabled) { background: #05b04c; }
+        .btn-share:disabled { opacity: 0.4; cursor: not-allowed; }
+
+        /* ── Share message ── */
+        .share-msg {
+          border-radius: 10px; padding: 10px 14px;
+          font-size: 13px; font-weight: 500; text-align: center;
+          margin-top: 4px;
+        }
+        .share-msg.ok  { background: rgba(6,199,85,0.1);  border: 1px solid rgba(6,199,85,0.25);  color: #06C755; }
+        .share-msg.err { background: rgba(248,113,113,0.08); border: 1px solid rgba(248,113,113,0.2); color: #f87171; }
+        .share-msg.info{ background: ${isDark ? 'rgba(56,189,248,0.08)' : 'rgba(2,132,199,0.06)'}; border: 1px solid ${isDark ? 'rgba(56,189,248,0.2)' : 'rgba(2,132,199,0.2)'}; color: var(--accent); }
+
+        /* ── Share tip box ── */
+        .share-tip {
+          background: ${isDark ? 'rgba(6,199,85,0.06)' : 'rgba(6,199,85,0.05)'};
+          border: 1px solid rgba(6,199,85,0.18);
+          border-radius: 10px; padding: 10px 14px;
+          font-size: 12px; color: ${isDark ? '#4ade80' : '#16a34a'};
+          line-height: 1.6;
+        }
+
         /* ── Qty row ── */
         .qty-row { display: flex; align-items: center; gap: 8px; }
         .qty-btn {
@@ -662,7 +787,6 @@ const handleSaveNow = async () => {
           color-scheme: ${isDark ? 'dark' : 'light'};
         }
         .date-inp:focus { border-color: var(--accent); }
-        /* Calendar icon color fix */
         .date-inp::-webkit-calendar-picker-indicator {
           filter: ${isDark ? 'invert(1) brightness(2)' : 'invert(0)'};
           cursor: pointer;
@@ -706,6 +830,15 @@ const handleSaveNow = async () => {
           border-top: 1px solid var(--border2);
         }
         .group-header:first-child { border-top: none; }
+
+        /* ── Divider ── */
+        .action-divider {
+          display: flex; align-items: center; gap: 10px;
+          font-size: 11px; color: var(--text5); font-family: 'IBM Plex Mono', monospace;
+        }
+        .action-divider::before, .action-divider::after {
+          content: ''; flex: 1; border-top: 1px solid var(--border);
+        }
 
         @media (max-width: 400px) {
           .main { padding: 10px 10px 36px; gap: 10px; }
@@ -783,11 +916,11 @@ const handleSaveNow = async () => {
                     <button
                       className="btn btn-primary btn-lg"
                       disabled={!sessionInput.trim()}
-                     onClick={() => { 
-  setSessionLabel(sessionInput.trim())
-  setSessionConfirmed(true)
-  setScanning(true)        // ← เพิ่มบรรทัดนี้
-}}
+                      onClick={() => {
+                        setSessionLabel(sessionInput.trim())
+                        setSessionConfirmed(true)
+                        setScanning(true)
+                      }}
                     >
                       ✅ ยืนยันหัวข้อ แล้วเริ่มสแกน
                     </button>
@@ -960,7 +1093,6 @@ const handleSaveNow = async () => {
                 <p style={{ textAlign: 'center', color: 'var(--text5)', padding: '32px 0', fontSize: 14 }}>ยังไม่มีประวัติ</p>
               ) : (
                 <div className="scroll-area">
-                  {/* Group by session_label */}
                   {(() => {
                     const groups: Record<string, ScanLog[]> = {}
                     logs.forEach(l => {
@@ -994,12 +1126,13 @@ const handleSaveNow = async () => {
           {/* ══════════ TAB: MANAGE ══════════ */}
           {tab === 'manage' && (
             <>
-              {/* Download CSV */}
+              {/* Download + Share CSV */}
               <div className="card">
                 <div className="card-header">
-                  <h2>⬇️ ดาวน์โหลดข้อมูล CSV</h2>
+                  <h2>📤 ดาวน์โหลด / แชร์ข้อมูล</h2>
                 </div>
                 <div className="card-body" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+
                   {/* Filter by label */}
                   <div>
                     <div className="filter-label">กรองตามหัวข้อ</div>
@@ -1018,9 +1151,46 @@ const handleSaveNow = async () => {
                       <input type="date" className="date-inp" value={dateTo} onChange={e => setDateTo(e.target.value)} />
                     </div>
                   </div>
+
+                  {/* Preview count */}
+                  {(() => {
+                    const count = getFilteredLogs().length
+                    return count > 0 ? (
+                      <div style={{ fontSize: 12, color: 'var(--text4)', fontFamily: "'IBM Plex Mono', monospace", textAlign: 'center' }}>
+                        {count} รายการที่จะส่ง{filterLabel ? ` · หัวข้อ "${filterLabel}"` : ''}
+                      </div>
+                    ) : null
+                  })()}
+
+                  {/* Download button */}
                   <button className="btn btn-success btn-lg" onClick={handleDownload}>
                     ⬇️ Download CSV {filterLabel ? `(${filterLabel})` : ''}
                   </button>
+
+                  {/* Divider */}
+                  <div className="action-divider">หรือ</div>
+
+                  {/* Share button */}
+                  <button
+                    className="btn btn-share"
+                    onClick={handleShare}
+                    disabled={sharing || getFilteredLogs().length === 0}
+                  >
+                    {sharing ? '⏳ กำลังเตรียมไฟล์...' : '💚 แชร์ไปยัง LINE / แอปอื่น'}
+                  </button>
+
+                  {/* Share result message */}
+                  {shareMsg && (
+                    <div className={`share-msg ${shareMsg.startsWith('✅') ? 'ok' : shareMsg.startsWith('ℹ️') ? 'info' : 'err'}`}>
+                      {shareMsg}
+                    </div>
+                  )}
+
+                  {/* Tip */}
+                  <div className="share-tip">
+                    💡 <strong>วิธีแชร์ไป LINE:</strong> กดปุ่มแชร์ → เลือก LINE → เลือกแชทหรือกลุ่มที่ต้องการ<br/>
+                    ไฟล์ CSV จะถูกส่งเป็นไฟล์แนบ เปิดได้ด้วย Excel หรือ Google Sheets
+                  </div>
                 </div>
               </div>
 
