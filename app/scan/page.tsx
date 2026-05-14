@@ -20,6 +20,11 @@ type PriceItem = {
   barcode_pack: string
   num_in_buy: number
   size: string
+  // ── Stock fields from products table (nullable — may not match) ──
+  on_hand: number | null
+  in_stock_cases: number | null
+  in_stock_pieces: number | null
+  stock_value: number | null
 }
 
 type ScanEntry = {
@@ -218,23 +223,50 @@ export default function ScanPage() {
     return () => { cancelled = true; stopCamera() }
   }, [scanning, sessionConfirmed, stopCamera])
 
-  // ── Barcode lookup ──
+  // ── Barcode lookup — joins products on barcode_piece ──
   const fetchByBarcode = async (barcode: string) => {
     setNotFound(false); setCurrentEntry(null)
     const cleaned = barcode.trim().replace(/\s/g, '')
     setLastSearched(cleaned)
-    const { data } = await supabase
+
+    // Use RPC / raw query via rpc or just two sequential fetches
+    // Step 1: find the pricelist row
+    const { data: priceData } = await supabase
       .from('pricelist')
       .select('*')
       .or(`barcode_piece.eq.${cleaned},barcode_case.eq.${cleaned},barcode_pack.eq.${cleaned},item_code.eq.${cleaned}`)
       .limit(1)
       .single()
-    if (!data) { setNotFound(true); return }
+
+    if (!priceData) { setNotFound(true); return }
+
+    // Step 2: try to match products table via barcode_piece
+    let stockData: { on_hand: number | null; in_stock_cases: number | null; in_stock_pieces: number | null; stock_value: number | null } | null = null
+
+    if (priceData.barcode_piece) {
+      const { data: prod } = await supabase
+        .from('products')
+        .select('on_hand, in_stock_cases, in_stock_pieces, stock_value')
+        .eq('barcode', priceData.barcode_piece)
+        .limit(1)
+        .single()
+      if (prod) stockData = prod
+    }
+
+    // Merge stock info into priceItem
+    const mergedItem: PriceItem = {
+      ...priceData,
+      on_hand: stockData?.on_hand ?? null,
+      in_stock_cases: stockData?.in_stock_cases ?? null,
+      in_stock_pieces: stockData?.in_stock_pieces ?? null,
+      stock_value: stockData?.stock_value ?? null,
+    }
+
     let barcodeType: BarcodeType = 'piece'
-    if (data.barcode_case === cleaned) barcodeType = 'case'
-    else if (data.barcode_pack === cleaned) barcodeType = 'pack'
+    if (priceData.barcode_case === cleaned) barcodeType = 'case'
+    else if (priceData.barcode_pack === cleaned) barcodeType = 'pack'
     const defaultUnit = barcodeType === 'case' ? 'ลัง' : barcodeType === 'pack' ? 'แพ็ค' : 'ชิ้น'
-    setCurrentEntry({ priceItem: data, barcodeType, quantity: 1, unit: defaultUnit, note: '' })
+    setCurrentEntry({ priceItem: mergedItem, barcodeType, quantity: 1, unit: defaultUnit, note: '' })
   }
 
   const handleManualSearch = async () => {
@@ -366,7 +398,6 @@ export default function ScanPage() {
     const fileName = buildFileName()
     const file = new File([blob], fileName, { type: 'text/csv;charset=utf-8;' })
 
-    // ── ลอง Web Share API (รองรับแชร์ไฟล์ + LINE) ──
     const supportsShare = typeof navigator.share === 'function'
     const canShareFile  = supportsShare && typeof navigator.canShare === 'function' && navigator.canShare({ files: [file] })
 
@@ -380,15 +411,12 @@ export default function ScanPage() {
         setShareMsg('✅ แชร์สำเร็จ')
       } catch (err: any) {
         if (err?.name !== 'AbortError') {
-          // Share file failed → fallback to text + link
           await shareTextFallback(filtered, fileName, blob)
         }
       }
     } else if (supportsShare) {
-      // รองรับ share แต่ไม่รองรับไฟล์ → แชร์เป็น text summary แทน
       await shareTextFallback(filtered, fileName, blob)
     } else {
-      // ไม่รองรับ Web Share API เลย → download แทน + แจ้ง
       handleDownload()
       setShareMsg('ℹ️ เบราว์เซอร์นี้ไม่รองรับการแชร์ — ดาวน์โหลดให้แล้ว')
     }
@@ -397,9 +425,7 @@ export default function ScanPage() {
     setTimeout(() => setShareMsg(''), 3000)
   }
 
-  // fallback: แชร์ข้อความสรุป พร้อม object URL ให้เปิดได้ (เบราว์เซอร์เก่า)
   const shareTextFallback = async (filtered: ScanLog[], fileName: string, blob: Blob) => {
-    // สร้าง summary text
     const groups: Record<string, ScanLog[]> = {}
     filtered.forEach(l => {
       const k = l.session_label || '(ไม่มีหัวข้อ)'
@@ -419,7 +445,6 @@ export default function ScanPage() {
 
     try {
       await navigator.share({ title: 'RSM สแกนสต็อก', text: summaryLines.join('\n') })
-      // ดาวน์โหลดไฟล์ให้ด้วยโดยอัตโนมัติ
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
       a.href = url; a.download = fileName; a.click()
@@ -440,6 +465,14 @@ export default function ScanPage() {
     case:  { label: 'บาร์ลัง',  color: '#f59e0b' },
     pack:  { label: 'บาร์แพ็ค', color: '#8b5cf6' },
   }[type])
+
+  // ── Stock level color helper ──
+  const stockColor = (val: number | null) => {
+    if (val === null) return 'var(--text5)'
+    if (val <= 0) return '#f87171'
+    if (val <= 10) return '#fb923c'
+    return '#34d399'
+  }
 
   // ── Theme CSS vars ──
   const darkVars = `
@@ -462,6 +495,8 @@ export default function ScanPage() {
     --tab-active-bg: rgba(56,189,248,0.04);
     --edit-bg: #0d1018;
     --cal-filter: invert(1);
+    --stock-bg: rgba(56,189,248,0.05);
+    --stock-border: rgba(56,189,248,0.12);
   `
   const lightVars = `
     --bg: #f1f5f9;
@@ -483,7 +518,61 @@ export default function ScanPage() {
     --tab-active-bg: rgba(2,132,199,0.06);
     --edit-bg: #f8fafc;
     --cal-filter: invert(0);
+    --stock-bg: rgba(2,132,199,0.04);
+    --stock-border: rgba(2,132,199,0.14);
   `
+
+  // ── Stock info panel ──
+  const StockPanel = ({ item }: { item: PriceItem }) => {
+    const hasStock = item.on_hand !== null || item.in_stock_cases !== null || item.in_stock_pieces !== null
+    if (!hasStock) return null
+
+    return (
+      <div style={{
+        background: 'var(--stock-bg)',
+        border: '1px solid var(--stock-border)',
+        borderRadius: 12,
+        padding: '11px 14px',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 8,
+      }}>
+        <div style={{ fontSize: 10, fontFamily: "'IBM Plex Mono', monospace", letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--text4)', marginBottom: 2 }}>
+          📦 ข้อมูลสต็อกปัจจุบัน
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8 }}>
+          <StockCell label="On Hand" value={item.on_hand} unit="ชิ้น" />
+          <StockCell label="ลัง" value={item.in_stock_cases} unit="ลัง" />
+          <StockCell label="ชิ้น" value={item.in_stock_pieces} unit="ชิ้น" />
+        </div>
+        {item.stock_value !== null && (
+          <div style={{ fontSize: 11, color: 'var(--text4)', fontFamily: "'IBM Plex Mono', monospace", textAlign: 'right', marginTop: 2 }}>
+            มูลค่า: <span style={{ color: 'var(--text2)', fontWeight: 600 }}>
+              ฿{item.stock_value.toLocaleString('th-TH', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+            </span>
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  const StockCell = ({ label, value, unit }: { label: string; value: number | null; unit: string }) => (
+    <div style={{
+      background: 'var(--bg2)',
+      border: '1px solid var(--border)',
+      borderRadius: 9,
+      padding: '8px 10px',
+      textAlign: 'center',
+    }}>
+      <div style={{ fontSize: 10, color: 'var(--meta-label)', fontFamily: "'IBM Plex Mono', monospace", letterSpacing: '0.05em', marginBottom: 4 }}>{label}</div>
+      <div style={{ fontSize: 18, fontWeight: 700, fontFamily: "'IBM Plex Mono', monospace", color: stockColor(value), lineHeight: 1 }}>
+        {value === null ? '—' : value}
+      </div>
+      {value !== null && (
+        <div style={{ fontSize: 10, color: 'var(--text5)', marginTop: 3 }}>{unit}</div>
+      )}
+    </div>
+  )
 
   return (
     <>
@@ -1009,12 +1098,16 @@ export default function ScanPage() {
                       </div>
                       <div className="card-body" style={{ display: 'flex', flexDirection: 'column', gap: 13 }}>
                         <p className="product-title">{currentEntry.priceItem.item_name}</p>
+
                         <div className="meta-grid">
                           <div className="meta-box"><div className="meta-label">รหัสสินค้า</div><div className="meta-value">{currentEntry.priceItem.item_code}</div></div>
                           <div className="meta-box"><div className="meta-label">ขนาด</div><div className="meta-value">{currentEntry.priceItem.size || '—'}</div></div>
                           <div className="meta-box"><div className="meta-label">แบรนด์</div><div className="meta-value">{currentEntry.priceItem.brand || '—'}</div></div>
                           <div className="meta-box"><div className="meta-label">ประเภทบาร์</div><div className="meta-value" style={{ color: barcodeBadge(currentEntry.barcodeType).color }}>{barcodeBadge(currentEntry.barcodeType).label}</div></div>
                         </div>
+
+                        {/* ── Stock info panel — shows only when products match ── */}
+                        <StockPanel item={currentEntry.priceItem} />
 
                         <div>
                           <div className="section-label">จำนวน</div>
@@ -1142,11 +1235,7 @@ export default function ScanPage() {
                     </select>
                   </div>
                   <div className="filter-grid">
-                    <div>
-                
-
-                    </div>
-                  
+                    <div></div>
                   </div>
 
                   {/* Preview count */}
