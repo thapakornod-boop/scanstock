@@ -373,6 +373,7 @@ export default function LoginPage() {
               <input
                 className="inp"
                 type={showIdCard ? 'text' : 'password'}
+                  maxLength={13}
                 inputMode="numeric"
                 placeholder="1-xxxx-xxxxx-xx-x"
                 value={idCard}
