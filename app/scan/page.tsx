@@ -57,9 +57,7 @@ type ScanLog = {
   created_at: string
 }
 
-// ── Date Input: controlled, no re-render keyboard-dismiss trick ──
-// Key insight: use uncontrolled input with ref + only format on blur or manual trigger
-// to prevent iOS keyboard dismiss on setState during typing
+// ── Date Input ──
 function DateInputField({
   value,
   onChange,
@@ -72,11 +70,8 @@ function DateInputField({
   icon: string
 }) {
   const inputRef = useRef<HTMLInputElement>(null)
-  // Keep internal raw digits separate from displayed value
-  // so we don't re-render (and thus dismiss keyboard) mid-typing
   const rawDigitsRef = useRef(value.replace(/\D/g, ''))
 
-  // Sync external value → raw digits when changed from outside (e.g. reset)
   useEffect(() => {
     rawDigitsRef.current = value.replace(/\D/g, '')
     if (inputRef.current && document.activeElement !== inputRef.current) {
@@ -96,13 +91,9 @@ function DateInputField({
     const digits = raw.replace(/\D/g, '').slice(0, 8)
     rawDigitsRef.current = digits
     const formatted = formatDigits(digits)
-    // Update DOM directly without causing React re-render
     el.value = formatted
-    // Move cursor to end
     const len = formatted.length
     try { el.setSelectionRange(len, len) } catch {}
-    // Notify parent - use setTimeout to batch outside render cycle
-    // so iOS doesn't collapse keyboard
     setTimeout(() => onChange(formatted), 0)
   }
 
@@ -165,11 +156,13 @@ export default function ScanPage() {
   const [theme, setTheme] = useState<Theme>('dark')
   const [scanning, setScanning] = useState(false)
 
-  // entries for current case (pending, not yet saved)
-  const [entries, setEntries] = useState<ScanEntry[]>([])
+  // ── allCases: เก็บทุกลังทั้งหัวข้อ ──
+  // key = case number, value = ScanEntry[]
+  const [allCases, setAllCases] = useState<Map<number, ScanEntry[]>>(new Map())
+
   const [currentEntry, setCurrentEntry] = useState<ScanEntry | null>(null)
   const [notFound, setNotFound] = useState(false)
-  const [savingCase, setSavingCase] = useState(false)
+  const [savingSession, setSavingSession] = useState(false)
   const [successMsg, setSuccessMsg] = useState('')
   const [employeeId, setEmployeeId] = useState('')
   const [employeeName, setEmployeeName] = useState('')
@@ -178,10 +171,13 @@ export default function ScanPage() {
   const [searching, setSearching] = useState(false)
   const [lastSearched, setLastSearched] = useState('')
 
-  // ── Session (Step 1) ──
+  // ── Session ──
   const [sessionLabel, setSessionLabel] = useState('')
   const [sessionConfirmed, setSessionConfirmed] = useState(false)
   const [sessionInput, setSessionInput] = useState('')
+
+  // ── ยืนยันบันทึกทั้งหัวข้อ ──
+  const [showConfirmSave, setShowConfirmSave] = useState(false)
 
   // ── Pallet photo ──
   const [palletPhotoMode, setPalletPhotoMode] = useState<'idle' | 'camera' | 'preview'>('idle')
@@ -190,7 +186,7 @@ export default function ScanPage() {
   const [palletCameraError, setPalletCameraError] = useState('')
   const [uploadingPhoto, setUploadingPhoto] = useState(false)
 
-  // ── Case counter (auto-increment, no pre-declaration) ──
+  // ── Case counter ──
   const [currentCaseNumber, setCurrentCaseNumber] = useState<number>(1)
 
   // ── History / manage ──
@@ -204,6 +200,19 @@ export default function ScanPage() {
 
   const router = useRouter()
   const supabase = createClient()
+
+  // helpers: current case entries
+  const currentEntries = allCases.get(currentCaseNumber) ?? []
+
+  const setCurrentEntries = useCallback((updater: (prev: ScanEntry[]) => ScanEntry[]) => {
+    setAllCases(prev => {
+      const next = new Map(prev)
+      next.set(currentCaseNumber, updater(next.get(currentCaseNumber) ?? []))
+      return next
+    })
+  }, [currentCaseNumber])
+
+  const totalEntriesCount = Array.from(allCases.values()).reduce((sum, arr) => sum + arr.length, 0)
 
   // ── Auth ──
   useEffect(() => {
@@ -285,7 +294,6 @@ export default function ScanPage() {
         photoVideoRef.current.setAttribute('playsinline', 'true')
         photoVideoRef.current.muted = true
         photoVideoRef.current.autoplay = true
-        // wait for metadata to be ready before play
         await new Promise<void>(resolve => {
           if (!photoVideoRef.current) return resolve()
           if (photoVideoRef.current.readyState >= 1) return resolve()
@@ -316,37 +324,27 @@ export default function ScanPage() {
     setPalletPhotoMode('preview')
   }, [stopPhotoCamera])
 
-  // ── FIX: upload photo without blocking — returns url directly ──
   const uploadPalletImage = useCallback(async (dataUrl: string): Promise<string | null> => {
     try {
-      setUploadingPhoto(true)
       const res = await fetch(dataUrl)
       const blob = await res.blob()
       const fileName = `pallet_${employeeId}_${Date.now()}.jpg`
       const { data, error } = await supabase.storage
         .from('pallet-photos')
         .upload(fileName, blob, { contentType: 'image/jpeg', upsert: false })
-      if (error) {
-        console.error('Upload error:', error)
-        setUploadingPhoto(false)
-        return null
-      }
+      if (error) { console.warn('Pallet upload skipped:', error.message); return null }
       const { data: urlData } = supabase.storage.from('pallet-photos').getPublicUrl(data.path)
-      setUploadingPhoto(false)
       return urlData.publicUrl
     } catch (err) {
-      console.error('uploadPalletImage error:', err)
-      setUploadingPhoto(false)
+      console.warn('uploadPalletImage error:', err)
       return null
     }
   }, [employeeId, supabase])
 
-  // ── FIX: confirm pallet photo — upload then immediately go to next step ──
   const handleConfirmPalletPhoto = useCallback(async () => {
     if (!palletImageDataUrl) return
     setUploadingPhoto(true)
     const url = await uploadPalletImage(palletImageDataUrl)
-    // Even if upload failed, still proceed (url will be null)
     setPalletImageUrl(url)
     setUploadingPhoto(false)
     setPalletPhotoMode('idle')
@@ -484,60 +482,98 @@ export default function ScanPage() {
     setSearching(false)
   }
 
-  // ── Add current entry to pending list for this case ──
+  // ── เพิ่มสินค้าลงลังปัจจุบัน (ยังไม่ save DB) ──
   const handleAddEntry = () => {
     if (!currentEntry) return
-    setEntries(prev => [...prev, currentEntry])
+    setCurrentEntries(prev => [...prev, currentEntry])
     setCurrentEntry(null); setNotFound(false); setManualBarcode('')
     setTimeout(() => setScanning(true), 300)
   }
 
-  // ── Save all pending entries for current case → DB, then increment case number ──
-  const handleCaseDone = async () => {
-    if (entries.length === 0) {
-      // No items but user wants to move to next case
-      setCurrentCaseNumber(n => n + 1)
-      setCurrentEntry(null)
-      setNotFound(false)
-      setManualBarcode('')
-      setScanning(true)
-      return
-    }
-    setSavingCase(true)
-    const records = entries.map(e => ({
-      employee_id: employeeId,
-      employee_name: employeeName,
-      barcode: e.barcodeType === 'piece' ? e.priceItem.barcode_piece
-             : e.barcodeType === 'case'  ? e.priceItem.barcode_case
-             : e.priceItem.barcode_pack,
-      item_code: e.priceItem.item_code,
-      product_name: e.priceItem.item_name,
-      brand: e.priceItem.brand,
-      size: e.priceItem.size,
-      unit: e.unit,
-      quantity: e.quantity,
-      note: e.note,
-      session_label: sessionLabel,
-      pallet_image_url: palletImageUrl || null,
-      mfg_date: e.mfgDate || null,
-      exp_date: e.expDate || null,
-      case_number: currentCaseNumber,
-      total_cases: null, // unknown total, filled later or left null
-    }))
-    const { error } = await supabase.from('scan_logs').insert(records)
-    if (error) { console.error(error); setSavingCase(false); return }
-    const savedCase = currentCaseNumber
-    setEntries([])
+  // ── ย้ายไปลังถัดไป (ยังไม่ save DB) ──
+  const handleNextCase = () => {
     setCurrentEntry(null)
     setNotFound(false)
     setManualBarcode('')
     setCurrentCaseNumber(n => n + 1)
-    setSavingCase(false)
-    setSuccessMsg(`✅ บันทึกลังที่ ${savedCase} แล้ว ${records.length} รายการ → เริ่มลังที่ ${savedCase + 1}`)
-    setTimeout(() => { setSuccessMsg(''); setScanning(true) }, 1800)
+    setTimeout(() => setScanning(true), 300)
   }
 
-  const handleDeleteEntry = (idx: number) => setEntries(prev => prev.filter((_, i) => i !== idx))
+  // ── ลบรายการใน current case ──
+  const handleDeleteEntry = (idx: number) => {
+    setCurrentEntries(prev => prev.filter((_, i) => i !== idx))
+  }
+
+  // ── ลบรายการใน case ที่ระบุ (ใน summary) ──
+  const handleDeleteEntryInCase = (caseNum: number, idx: number) => {
+    setAllCases(prev => {
+      const next = new Map(prev)
+      const arr = (next.get(caseNum) ?? []).filter((_, i) => i !== idx)
+      if (arr.length === 0) next.delete(caseNum)
+      else next.set(caseNum, arr)
+      return next
+    })
+  }
+
+  // ── บันทึกทั้งหัวข้อลง DB ทีเดียว ──
+  const handleSaveSession = async () => {
+    if (totalEntriesCount === 0) return
+    setSavingSession(true)
+    const totalCases = allCases.size
+
+    const records: object[] = []
+    allCases.forEach((entries, caseNum) => {
+      entries.forEach(e => {
+        records.push({
+          employee_id: employeeId,
+          employee_name: employeeName,
+          barcode: e.barcodeType === 'piece' ? e.priceItem.barcode_piece
+                 : e.barcodeType === 'case'  ? e.priceItem.barcode_case
+                 : e.priceItem.barcode_pack,
+          item_code: e.priceItem.item_code,
+          product_name: e.priceItem.item_name,
+          brand: e.priceItem.brand,
+          size: e.priceItem.size,
+          unit: e.unit,
+          quantity: e.quantity,
+          note: e.note,
+          session_label: sessionLabel,
+          pallet_image_url: palletImageUrl || null,
+          mfg_date: e.mfgDate || null,
+          exp_date: e.expDate || null,
+          case_number: caseNum,
+          total_cases: totalCases,
+        })
+      })
+    })
+
+    const { error } = await supabase.from('scan_logs').insert(records)
+    if (error) {
+      console.error(error)
+      setSavingSession(false)
+      setShowConfirmSave(false)
+      setSuccessMsg(`❌ เกิดข้อผิดพลาด: ${error.message}`)
+      setTimeout(() => setSuccessMsg(''), 3000)
+      return
+    }
+
+    // reset ทั้งหมด
+    setAllCases(new Map())
+    setCurrentEntry(null)
+    setNotFound(false)
+    setManualBarcode('')
+    setCurrentCaseNumber(1)
+    setSessionConfirmed(false)
+    setSessionInput('')
+    setPalletImageUrl(null)
+    setPalletImageDataUrl(null)
+    setPalletPhotoMode('idle')
+    setShowConfirmSave(false)
+    setSavingSession(false)
+    setScanning(false)
+    setSuccessMsg(`✅ บันทึกหัวข้อ "${sessionLabel}" สำเร็จ — ${records.length} รายการ ${totalCases} ลัง`)
+    setTimeout(() => setSuccessMsg(''), 3000)
+  }
 
   const handleDeleteLog = async (id: string) => {
     await supabase.from('scan_logs').delete().eq('id', id)
@@ -565,9 +601,9 @@ export default function ScanPage() {
   }
 
   const buildCsvBlob = (filtered: ScanLog[]): Blob => {
-    const header = 'วันที่,รหัสพนักงาน,ชื่อพนักงาน,หัวข้อ,ลังที่,รหัสสินค้า,ชื่อสินค้า,แบรนด์,ขนาด,จำนวน,หน่วย,วันผลิต,วันหมดอายุ,หมายเหตุ,รูปพาเลท\n'
+    const header = 'วันที่,รหัสพนักงาน,ชื่อพนักงาน,หัวข้อ,ลังที่,จำนวนลังทั้งหมด,รหัสสินค้า,ชื่อสินค้า,แบรนด์,ขนาด,จำนวน,หน่วย,วันผลิต,วันหมดอายุ,หมายเหตุ,รูปพาเลท\n'
     const rows = filtered.map(l =>
-      `${new Date(l.created_at).toLocaleString('th-TH')},${l.employee_id},${l.employee_name},${l.session_label || ''},${l.case_number ?? ''},${l.item_code},${l.product_name},${l.brand},${l.size},${l.quantity},${l.unit},${l.mfg_date || ''},${l.exp_date || ''},${l.note},${l.pallet_image_url || ''}`
+      `${new Date(l.created_at).toLocaleString('th-TH')},${l.employee_id},${l.employee_name},${l.session_label || ''},${l.case_number ?? ''},${l.total_cases ?? ''},${l.item_code},${l.product_name},${l.brand},${l.size},${l.quantity},${l.unit},${l.mfg_date || ''},${l.exp_date || ''},${l.note},${l.pallet_image_url || ''}`
     ).join('\n')
     return new Blob(['\uFEFF' + header + rows], { type: 'text/csv;charset=utf-8;' })
   }
@@ -673,8 +709,6 @@ export default function ScanPage() {
       <div style={{ fontSize: 11, color: 'var(--text4)', fontFamily: "'IBM Plex Mono',monospace", letterSpacing: '0.06em', textTransform: 'uppercase' }}>
         📸 ถ่ายรูปพาเลท (ไม่บังคับ)
       </div>
-
-      {/* idle + no photo yet */}
       {palletPhotoMode === 'idle' && !palletImageDataUrl && !palletImageUrl && (
         <button type="button" className="btn btn-ghost btn-md"
           style={{ width: '100%', border: '2px dashed var(--border)', borderRadius: 12, padding: 16, fontSize: 16 }}
@@ -682,8 +716,6 @@ export default function ScanPage() {
           📷 ถ่ายรูปพาเลท
         </button>
       )}
-
-      {/* camera active */}
       {palletPhotoMode === 'camera' && (
         <div style={{ borderRadius: 12, overflow: 'hidden', border: '1px solid var(--border)' }}>
           {palletCameraError ? (
@@ -716,16 +748,13 @@ export default function ScanPage() {
           )}
         </div>
       )}
-
-      {/* preview captured photo */}
       {palletPhotoMode === 'preview' && palletImageDataUrl && (
         <div style={{ borderRadius: 12, overflow: 'hidden', border: '1px solid var(--border)' }}>
           <img src={palletImageDataUrl} alt="pallet preview"
             style={{ width: '100%', display: 'block', aspectRatio: '4/3', objectFit: 'cover' }} />
           <div style={{ display: 'flex', gap: 8, padding: '10px 12px', background: 'var(--bg3)' }}>
             <button className="btn btn-primary btn-md" style={{ flex: 1 }}
-              onClick={handleConfirmPalletPhoto}
-              disabled={uploadingPhoto}>
+              onClick={handleConfirmPalletPhoto} disabled={uploadingPhoto}>
               {uploadingPhoto ? '⏳ กำลังอัปโหลด...' : '✅ ใช้รูปนี้'}
             </button>
             <button className="btn btn-ghost btn-md"
@@ -735,14 +764,14 @@ export default function ScanPage() {
           </div>
         </div>
       )}
-
-      {/* photo confirmed & uploaded */}
-      {palletPhotoMode === 'idle' && palletImageUrl && (
-        <div style={{ borderRadius: 12, overflow: 'hidden', border: '1px solid rgba(52,211,153,0.3)' }}>
-          <img src={palletImageUrl} alt="pallet"
+      {palletPhotoMode === 'idle' && palletImageDataUrl && (
+        <div style={{ borderRadius: 12, overflow: 'hidden', border: `1px solid ${palletImageUrl ? 'rgba(52,211,153,0.3)' : 'rgba(245,158,11,0.3)'}` }}>
+          <img src={palletImageUrl || palletImageDataUrl} alt="pallet"
             style={{ width: '100%', display: 'block', aspectRatio: '4/3', objectFit: 'cover' }} />
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', background: 'rgba(52,211,153,0.06)' }}>
-            <span style={{ fontSize: 13, color: '#34d399', fontWeight: 600 }}>✅ บันทึกรูปพาเลทแล้ว</span>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', background: palletImageUrl ? 'rgba(52,211,153,0.06)' : 'rgba(245,158,11,0.06)' }}>
+            <span style={{ fontSize: 13, color: palletImageUrl ? '#34d399' : '#f59e0b', fontWeight: 600 }}>
+              {palletImageUrl ? '✅ บันทึกรูปพาเลทแล้ว' : '📷 รูปพาเลท (เก็บในเครื่อง)'}
+            </span>
             <button className="btn btn-ghost btn-sm"
               onClick={() => { setPalletImageUrl(null); setPalletImageDataUrl(null); setPalletPhotoMode('camera') }}>
               🔄 เปลี่ยนรูป
@@ -750,29 +779,60 @@ export default function ScanPage() {
           </div>
         </div>
       )}
-
-      {/* captured but not yet uploaded (edge case) */}
-      {palletPhotoMode === 'idle' && palletImageDataUrl && !palletImageUrl && (
-        <div style={{ borderRadius: 12, overflow: 'hidden', border: '1px solid var(--border)' }}>
-          <img src={palletImageDataUrl} alt="pallet preview"
-            style={{ width: '100%', display: 'block', aspectRatio: '4/3', objectFit: 'cover' }} />
-          <div style={{ display: 'flex', gap: 8, padding: '8px 12px', background: 'var(--bg3)' }}>
-            <button className="btn btn-primary btn-md" style={{ flex: 1 }}
-              onClick={handleConfirmPalletPhoto}
-              disabled={uploadingPhoto}>
-              {uploadingPhoto ? '⏳ กำลังอัปโหลด...' : '✅ ยืนยันใช้รูปนี้'}
-            </button>
-            <button className="btn btn-ghost btn-md"
-              onClick={() => { setPalletImageDataUrl(null); setPalletPhotoMode('camera') }}>
-              🔄 ถ่ายใหม่
-            </button>
-          </div>
-        </div>
-      )}
     </div>
   )
 
-  // ── Case status pill ──
+  // ── Session Summary (แสดงก่อนยืนยัน save) ──
+  const SessionSummary = () => (
+    <div className="card">
+      <div className="card-header accent">
+        <h2>📋 สรุปหัวข้อ "{sessionLabel}"</h2>
+        <span className="badge" style={{ color: '#f59e0b', borderColor: 'rgba(245,158,11,0.3)', background: 'rgba(245,158,11,0.1)' }}>
+          {totalEntriesCount} รายการ · {allCases.size} ลัง
+        </span>
+      </div>
+      <div className="scroll-area" style={{ maxHeight: '50vh' }}>
+        {Array.from(allCases.entries()).sort(([a], [b]) => a - b).map(([caseNum, entries]) => (
+          <div key={caseNum}>
+            <div className="case-group-header">
+              📦 ลังที่ {caseNum} · {entries.length} รายการ
+            </div>
+            {entries.map((e, idx) => (
+              <div key={idx} className="entry-item">
+                <div style={{ flex: 1 }}>
+                  <div className="entry-name">{e.priceItem.item_name}</div>
+                  <div className="entry-meta">
+                    {e.quantity} {e.unit}
+                    {e.mfgDate ? ` · MFG ${e.mfgDate}` : ''}
+                    {e.expDate ? ` · EXP ${e.expDate}` : ''}
+                    {e.note ? ` · ${e.note}` : ''}
+                  </div>
+                </div>
+                <button className="btn btn-danger btn-sm"
+                  onClick={() => handleDeleteEntryInCase(caseNum, idx)}>🗑</button>
+              </div>
+            ))}
+          </div>
+        ))}
+      </div>
+      <div style={{ padding: '14px', display: 'flex', flexDirection: 'column', gap: 10 }}>
+        <button
+          className="btn-session-save"
+          onClick={handleSaveSession}
+          disabled={savingSession || totalEntriesCount === 0}>
+          {savingSession
+            ? '⏳ กำลังบันทึก...'
+            : `✅ ยืนยันบันทึกทั้งหัวข้อ — ${totalEntriesCount} รายการ ${allCases.size} ลัง`}
+        </button>
+        <button className="btn btn-ghost btn-md"
+          onClick={() => setShowConfirmSave(false)}>
+          ← กลับไปสแกนต่อ
+        </button>
+      </div>
+    </div>
+  )
+
+  // ── Case pill ──
   const CasePill = () => (
     <div style={{
       display: 'inline-flex', alignItems: 'center', gap: 8,
@@ -783,9 +843,9 @@ export default function ScanPage() {
       <span style={{ fontSize: 14, color: '#f59e0b', fontFamily: "'IBM Plex Mono',monospace", fontWeight: 700 }}>
         📦 ลังที่ {currentCaseNumber}
       </span>
-      {entries.length > 0 && (
+      {currentEntries.length > 0 && (
         <span style={{ fontSize: 12, color: 'var(--text4)', fontFamily: "'IBM Plex Mono',monospace" }}>
-          · {entries.length} รายการ
+          · {currentEntries.length} รายการ
         </span>
       )}
     </div>
@@ -931,8 +991,8 @@ export default function ScanPage() {
 
         .pallet-thumb{width:48px;height:48px;border-radius:8px;object-fit:cover;border:1px solid var(--border);flex-shrink:0;cursor:pointer;}
 
-        /* Case done button — highlighted */
-        .btn-case-done{
+        /* ปุ่มไปลังถัดไป */
+        .btn-next-case{
           background:linear-gradient(135deg,#f59e0b,#d97706);
           color:#fff;font-size:15px;font-weight:700;
           padding:14px 20px;width:100%;border-radius:12px;border:none;
@@ -940,8 +1000,23 @@ export default function ScanPage() {
           box-shadow:0 4px 14px rgba(245,158,11,0.3);
           transition:all 0.2s;
         }
-        .btn-case-done:active{transform:scale(0.97);}
-        .btn-case-done:disabled{opacity:0.4;cursor:not-allowed;}
+        .btn-next-case:active{transform:scale(0.97);}
+        .btn-next-case:disabled{opacity:0.4;cursor:not-allowed;}
+
+        /* ปุ่มยืนยันบันทึกทั้งหัวข้อ — เขียว เน้นมาก */
+        .btn-session-save{
+          background:linear-gradient(135deg,#10b981,#059669);
+          color:#fff;font-size:15px;font-weight:700;
+          padding:16px 20px;width:100%;border-radius:12px;border:none;
+          font-family:'Sarabun',sans-serif;cursor:pointer;
+          box-shadow:0 4px 18px rgba(16,185,129,0.35);
+          transition:all 0.2s;
+        }
+        .btn-session-save:active{transform:scale(0.97);}
+        .btn-session-save:disabled{opacity:0.4;cursor:not-allowed;}
+
+        /* แถบ mini-summary ทุกลัง */
+        .mini-cases-bar{display:flex;gap:6px;flex-wrap:wrap;padding:2px 0;}
 
         @media(max-width:400px){
           .main{padding:10px 10px 36px;gap:10px;}
@@ -986,7 +1061,7 @@ export default function ScanPage() {
             <>
               {successMsg && <div className="success-bar">{successMsg}</div>}
 
-              {/* ── STEP 1: หัวข้อ + ถ่ายรูปพาเลท ── */}
+              {/* ── STEP 1: ตั้งหัวข้อ ── */}
               {!sessionConfirmed ? (
                 <div className="card">
                   <div className="card-header accent">
@@ -997,7 +1072,6 @@ export default function ScanPage() {
                       กรอกหัวข้อหรือชื่อรอบการตรวจนับ<br/>
                       เช่น <strong>เช็คสต็อก</strong>, <strong>รับสินค้าเข้า</strong>
                     </p>
-
                     <input
                       type="text"
                       className="inp-bare"
@@ -1012,265 +1086,288 @@ export default function ScanPage() {
                         }
                       }}
                     />
-
-                    {/* ── ถ่ายรูปพาเลท ── */}
                     <PalletPhotoSection />
-
                     <button
                       className="btn btn-primary btn-lg"
                       disabled={!sessionInput.trim()}
                       onClick={() => {
                         setSessionLabel(sessionInput.trim())
                         setCurrentCaseNumber(1)
+                        setAllCases(new Map())
                         setSessionConfirmed(true)
                         setScanning(true)
-                      }}
-                    >
+                      }}>
                       ✅ ยืนยัน — เริ่มสแกนลังที่ 1
                     </button>
                   </div>
                 </div>
               ) : (
                 <>
-                  {/* Session badge + change button */}
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
-                    <div className="session-current" style={{ flex: 1 }}>
-                      <span>📋 {sessionLabel}</span>
-                      {palletImageUrl && (
-                        <img src={palletImageUrl} alt="pallet"
-                          style={{ width: 32, height: 32, borderRadius: 6, objectFit: 'cover', border: '1px solid rgba(52,211,153,0.4)', marginLeft: 'auto', cursor: 'pointer' }}
-                          onClick={() => window.open(palletImageUrl, '_blank')} />
+                  {/* ── Session summary view ── */}
+                  {showConfirmSave ? (
+                    <SessionSummary />
+                  ) : (
+                    <>
+                      {/* Session badge */}
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
+                        <div className="session-current" style={{ flex: 1 }}>
+                          <span>📋 {sessionLabel}</span>
+                          {totalEntriesCount > 0 && (
+                            <span style={{ fontSize: 11, color: 'var(--text4)', fontFamily: "'IBM Plex Mono',monospace", marginLeft: 'auto' }}>
+                              รวม {totalEntriesCount} รายการ · {allCases.size} ลัง
+                            </span>
+                          )}
+                          {palletImageUrl && (
+                            <img src={palletImageUrl} alt="pallet"
+                              style={{ width: 32, height: 32, borderRadius: 6, objectFit: 'cover', border: '1px solid rgba(52,211,153,0.4)', marginLeft: 8, cursor: 'pointer' }}
+                              onClick={() => window.open(palletImageUrl, '_blank')} />
+                          )}
+                        </div>
+                        <button className="btn btn-ghost btn-sm" onClick={() => {
+                          stopCamera(); setScanning(false)
+                          setSessionConfirmed(false); setSessionInput('')
+                          setCurrentEntry(null); setNotFound(false); setManualBarcode('')
+                          setAllCases(new Map())
+                          setPalletImageUrl(null); setPalletImageDataUrl(null); setPalletPhotoMode('idle')
+                          setCurrentCaseNumber(1)
+                          setShowConfirmSave(false)
+                        }}>เปลี่ยนหัวข้อ</button>
+                      </div>
+
+                      {/* Mini cases bar — แสดงลังที่สแกนไปแล้ว */}
+                      {allCases.size > 0 && (
+                        <div className="mini-cases-bar">
+                          {Array.from(allCases.entries()).sort(([a],[b])=>a-b).map(([caseNum, entries]) => (
+                            <div key={caseNum} style={{
+                              display: 'inline-flex', alignItems: 'center', gap: 4,
+                              background: caseNum === currentCaseNumber
+                                ? 'rgba(245,158,11,0.15)' : isDark ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.04)',
+                              border: `1px solid ${caseNum === currentCaseNumber ? 'rgba(245,158,11,0.4)' : 'var(--border)'}`,
+                              borderRadius: 20, padding: '4px 10px',
+                            }}>
+                              <span style={{ fontSize: 11, color: caseNum === currentCaseNumber ? '#f59e0b' : 'var(--text4)', fontFamily: "'IBM Plex Mono',monospace", fontWeight: 600 }}>
+                                ลัง {caseNum}
+                              </span>
+                              <span style={{ fontSize: 10, color: 'var(--text5)', fontFamily: "'IBM Plex Mono',monospace" }}>
+                                {entries.length}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
                       )}
-                    </div>
-                    <button className="btn btn-ghost btn-sm" onClick={() => {
-                      stopCamera(); setScanning(false)
-                      setSessionConfirmed(false); setSessionInput('')
-                      setCurrentEntry(null); setNotFound(false); setManualBarcode('')
-                      setEntries([])
-                      setPalletImageUrl(null); setPalletImageDataUrl(null); setPalletPhotoMode('idle')
-                      setCurrentCaseNumber(1)
-                    }}>เปลี่ยนหัวข้อ</button>
-                  </div>
 
-                  {/* Current case pill */}
-                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                    <CasePill />
-                    {entries.length === 0 && currentCaseNumber > 1 && (
-                      <span style={{ fontSize: 12, color: 'var(--text4)', fontFamily: "'IBM Plex Mono',monospace" }}>
-                        ลังก่อนหน้าบันทึกแล้ว ✓
-                      </span>
-                    )}
-                  </div>
-
-                  {/* Camera Card */}
-                  {scanning && (
-                    <div className="card">
-                      <div className="card-header accent">
-                        <h2>📷 สแกนบาร์โค้ด</h2>
-                        <span className="badge" style={{ color: '#f59e0b', borderColor: 'rgba(245,158,11,0.3)', background: 'rgba(245,158,11,0.1)' }}>
-                          ลัง {currentCaseNumber}
-                        </span>
+                      {/* Current case pill */}
+                      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                        <CasePill />
                       </div>
-                      {cameraError ? (
-                        <div className="cam-error">
-                          <span className="icon">📵</span>
-                          <p>{cameraError}</p>
-                          <button className="btn btn-primary btn-md"
-                            onClick={() => { setCameraError(''); setScanning(false); setTimeout(() => setScanning(true), 400) }}>
-                            ลองใหม่
-                          </button>
-                        </div>
-                      ) : (
-                        <>
-                          <div className="camera-wrap">
-                            <video ref={videoRef} playsInline muted autoPlay
-                              style={{ display: 'block', width: '100%', height: '100%', objectFit: 'cover' }} />
-                            <div className="scan-line" />
-                            <div className="corner corner-tl" /><div className="corner corner-tr" />
-                            <div className="corner corner-bl" /><div className="corner corner-br" />
+
+                      {/* Camera Card */}
+                      {scanning && (
+                        <div className="card">
+                          <div className="card-header accent">
+                            <h2>📷 สแกนบาร์โค้ด</h2>
+                            <span className="badge" style={{ color: '#f59e0b', borderColor: 'rgba(245,158,11,0.3)', background: 'rgba(245,158,11,0.1)' }}>
+                              ลัง {currentCaseNumber}
+                            </span>
                           </div>
-                          <p className="camera-hint">จ่อบาร์โค้ดให้ตรงกรอบเพื่อสแกนอัตโนมัติ</p>
-                        </>
+                          {cameraError ? (
+                            <div className="cam-error">
+                              <span className="icon">📵</span>
+                              <p>{cameraError}</p>
+                              <button className="btn btn-primary btn-md"
+                                onClick={() => { setCameraError(''); setScanning(false); setTimeout(() => setScanning(true), 400) }}>
+                                ลองใหม่
+                              </button>
+                            </div>
+                          ) : (
+                            <>
+                              <div className="camera-wrap">
+                                <video ref={videoRef} playsInline muted autoPlay
+                                  style={{ display: 'block', width: '100%', height: '100%', objectFit: 'cover' }} />
+                                <div className="scan-line" />
+                                <div className="corner corner-tl" /><div className="corner corner-tr" />
+                                <div className="corner corner-bl" /><div className="corner corner-br" />
+                              </div>
+                              <p className="camera-hint">จ่อบาร์โค้ดให้ตรงกรอบเพื่อสแกนอัตโนมัติ</p>
+                            </>
+                          )}
+                          <div className="manual-row">
+                            <div className="input-rel">
+                              <span className="input-icon-abs">🔍</span>
+                              <input type="text" inputMode="numeric" className="inp"
+                                value={manualBarcode}
+                                onChange={e => setManualBarcode(e.target.value)}
+                                onKeyDown={e => e.key === 'Enter' && handleManualSearch()}
+                                placeholder="พิมพ์บาร์โค้ด / รหัสสินค้า" />
+                            </div>
+                            <button className="btn btn-primary btn-md"
+                              onClick={handleManualSearch}
+                              disabled={searching || !manualBarcode.trim()}>
+                              {searching ? '...' : 'ค้นหา'}
+                            </button>
+                          </div>
+                        </div>
                       )}
-                      <div className="manual-row">
-                        <div className="input-rel">
-                          <span className="input-icon-abs">🔍</span>
-                          <input type="text" inputMode="numeric" className="inp"
-                            value={manualBarcode}
-                            onChange={e => setManualBarcode(e.target.value)}
-                            onKeyDown={e => e.key === 'Enter' && handleManualSearch()}
-                            placeholder="พิมพ์บาร์โค้ด / รหัสสินค้า" />
-                        </div>
-                        <button className="btn btn-primary btn-md"
-                          onClick={handleManualSearch}
-                          disabled={searching || !manualBarcode.trim()}>
-                          {searching ? '...' : 'ค้นหา'}
-                        </button>
-                      </div>
-                    </div>
-                  )}
 
-                  {/* Not Found */}
-                  {notFound && (
-                    <div className="card">
-                      <div className="not-found">
-                        <span style={{ fontSize: 42 }}>❌</span>
-                        <p style={{ color: 'var(--text)', fontWeight: 600, fontSize: 15, margin: 0 }}>ไม่พบสินค้าในระบบ</p>
-                        <span className="barcode-mono">{lastSearched}</span>
-                        <button className="btn btn-primary btn-md" style={{ marginTop: 6 }}
-                          onClick={() => { setNotFound(false); setManualBarcode(''); setScanning(true) }}>
-                          📷 สแกนใหม่
-                        </button>
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Current Entry Form */}
-                  {currentEntry && (
-                    <div className="card">
-                      <div className="card-header">
-                        <h2>กรอกข้อมูลสินค้า</h2>
-                        <div style={{ display: 'flex', gap: 6 }}>
-                          <span className="badge" style={{ color: '#f59e0b', borderColor: 'rgba(245,158,11,0.3)', background: 'rgba(245,158,11,0.1)' }}>
-                            ลัง {currentCaseNumber}
-                          </span>
-                          {(() => {
-                            const b = barcodeBadge(currentEntry.barcodeType)
-                            return <span className="badge" style={{ color: b.color, borderColor: b.color+'44', background: b.color+'14' }}>{b.label}</span>
-                          })()}
-                        </div>
-                      </div>
-                      <div className="card-body" style={{ display: 'flex', flexDirection: 'column', gap: 13 }}>
-                        <p className="product-title">{currentEntry.priceItem.item_name}</p>
-
-                        <div className="meta-grid">
-                          <div className="meta-box"><div className="meta-label">รหัสสินค้า</div><div className="meta-value">{currentEntry.priceItem.item_code}</div></div>
-                          <div className="meta-box"><div className="meta-label">ขนาด</div><div className="meta-value">{currentEntry.priceItem.size || '—'}</div></div>
-                          <div className="meta-box"><div className="meta-label">แบรนด์</div><div className="meta-value">{currentEntry.priceItem.brand || '—'}</div></div>
-                          <div className="meta-box"><div className="meta-label">ประเภทบาร์</div><div className="meta-value" style={{ color: barcodeBadge(currentEntry.barcodeType).color }}>{barcodeBadge(currentEntry.barcodeType).label}</div></div>
-                        </div>
-
-                        <StockPanel item={currentEntry.priceItem} />
-
-                        <div>
-                          <div className="section-label">จำนวน</div>
-                          <div className="qty-row">
-                            <button className="qty-btn"
-                              onClick={() => setCurrentEntry(e => e ? { ...e, quantity: Math.max(1, e.quantity - 1) } : e)}>−</button>
-                            <input type="number" className="qty-input"
-                              value={currentEntry.quantity}
-                              onChange={ev => setCurrentEntry(e => e ? { ...e, quantity: Math.max(1, parseInt(ev.target.value) || 1) } : e)} />
-                            <button className="qty-btn"
-                              onClick={() => setCurrentEntry(e => e ? { ...e, quantity: e.quantity + 1 } : e)}>+</button>
+                      {/* Not Found */}
+                      {notFound && (
+                        <div className="card">
+                          <div className="not-found">
+                            <span style={{ fontSize: 42 }}>❌</span>
+                            <p style={{ color: 'var(--text)', fontWeight: 600, fontSize: 15, margin: 0 }}>ไม่พบสินค้าในระบบ</p>
+                            <span className="barcode-mono">{lastSearched}</span>
+                            <button className="btn btn-primary btn-md" style={{ marginTop: 6 }}
+                              onClick={() => { setNotFound(false); setManualBarcode(''); setScanning(true) }}>
+                              📷 สแกนใหม่
+                            </button>
                           </div>
                         </div>
+                      )}
 
-                        <div>
-                          <div className="section-label">หน่วย</div>
-                          <div className="unit-group">
-                            {unitOptions.map(u => (
-                              <button key={u} className={`unit-btn ${currentEntry.unit === u ? 'active' : ''}`}
-                                onClick={() => setCurrentEntry(e => e ? { ...e, unit: u } : e)}>{u}</button>
-                            ))}
+                      {/* Current Entry Form */}
+                      {currentEntry && (
+                        <div className="card">
+                          <div className="card-header">
+                            <h2>กรอกข้อมูลสินค้า</h2>
+                            <div style={{ display: 'flex', gap: 6 }}>
+                              <span className="badge" style={{ color: '#f59e0b', borderColor: 'rgba(245,158,11,0.3)', background: 'rgba(245,158,11,0.1)' }}>
+                                ลัง {currentCaseNumber}
+                              </span>
+                              {(() => {
+                                const b = barcodeBadge(currentEntry.barcodeType)
+                                return <span className="badge" style={{ color: b.color, borderColor: b.color+'44', background: b.color+'14' }}>{b.label}</span>
+                              })()}
+                            </div>
                           </div>
-                        </div>
-
-                        {/* วันผลิต — fixed keyboard dismiss */}
-                        <div>
-                          <div className="section-label">วันผลิต / MFG Date</div>
-                          <DateInputField
-                            value={currentEntry.mfgDate}
-                            onChange={v => setCurrentEntry(e => e ? { ...e, mfgDate: v } : e)}
-                            placeholder="วว/ดด/ปปปป เช่น 01/06/2568"
-                            icon="🏭"
-                          />
-                        </div>
-
-                        {/* วันหมดอายุ — fixed keyboard dismiss */}
-                        <div>
-                          <div className="section-label">วันหมดอายุ / EXP Date</div>
-                          <DateInputField
-                            value={currentEntry.expDate}
-                            onChange={v => setCurrentEntry(e => e ? { ...e, expDate: v } : e)}
-                            placeholder="วว/ดด/ปปปป เช่น 01/06/2570"
-                            icon="⏰"
-                          />
-                        </div>
-
-                        <input type="text" className="inp-bare"
-                          placeholder="หมายเหตุ (ถ้ามี)"
-                          value={currentEntry.note}
-                          onChange={ev => setCurrentEntry(e => e ? { ...e, note: ev.target.value } : e)} />
-
-                        {/* Add to pending list for this case */}
-                        <button className="btn btn-success btn-lg" onClick={handleAddEntry}>
-                          ➕ เพิ่มในลังที่ {currentCaseNumber}
-                        </button>
-                        <button className="btn btn-ghost btn-md"
-                          onClick={() => { setCurrentEntry(null); setManualBarcode(''); setScanning(true) }}>
-                          📷 สแกนใหม่
-                        </button>
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Pending Entries for current case */}
-                  {entries.length > 0 && (
-                    <div className="card">
-                      <div className="card-header">
-                        <h2>📦 รายการในลังที่ {currentCaseNumber}</h2>
-                        <span className="badge" style={{ color: '#f59e0b', borderColor: 'rgba(245,158,11,0.3)', background: 'rgba(245,158,11,0.1)' }}>
-                          {entries.length} รายการ
-                        </span>
-                      </div>
-                      <div className="scroll-area">
-                        {entries.map((e, idx) => (
-                          <div key={idx} className="entry-item">
-                            <div style={{ flex: 1 }}>
-                              <div className="entry-name">{e.priceItem.item_name}</div>
-                              <div className="entry-meta">
-                                {e.quantity} {e.unit}
-                                {e.mfgDate ? ` · MFG ${e.mfgDate}` : ''}
-                                {e.expDate ? ` · EXP ${e.expDate}` : ''}
-                                {e.note ? ` · ${e.note}` : ''}
+                          <div className="card-body" style={{ display: 'flex', flexDirection: 'column', gap: 13 }}>
+                            <p className="product-title">{currentEntry.priceItem.item_name}</p>
+                            <div className="meta-grid">
+                              <div className="meta-box"><div className="meta-label">รหัสสินค้า</div><div className="meta-value">{currentEntry.priceItem.item_code}</div></div>
+                              <div className="meta-box"><div className="meta-label">ขนาด</div><div className="meta-value">{currentEntry.priceItem.size || '—'}</div></div>
+                              <div className="meta-box"><div className="meta-label">แบรนด์</div><div className="meta-value">{currentEntry.priceItem.brand || '—'}</div></div>
+                              <div className="meta-box"><div className="meta-label">ประเภทบาร์</div><div className="meta-value" style={{ color: barcodeBadge(currentEntry.barcodeType).color }}>{barcodeBadge(currentEntry.barcodeType).label}</div></div>
+                            </div>
+                            <StockPanel item={currentEntry.priceItem} />
+                            <div>
+                              <div className="section-label">จำนวน</div>
+                              <div className="qty-row">
+                                <button className="qty-btn"
+                                  onClick={() => setCurrentEntry(e => e ? { ...e, quantity: Math.max(1, e.quantity - 1) } : e)}>−</button>
+                                <input type="number" className="qty-input"
+                                  value={currentEntry.quantity}
+                                  onChange={ev => setCurrentEntry(e => e ? { ...e, quantity: Math.max(1, parseInt(ev.target.value) || 1) } : e)} />
+                                <button className="qty-btn"
+                                  onClick={() => setCurrentEntry(e => e ? { ...e, quantity: e.quantity + 1 } : e)}>+</button>
                               </div>
                             </div>
-                            <button className="btn btn-danger btn-sm" onClick={() => handleDeleteEntry(idx)}>🗑</button>
+                            <div>
+                              <div className="section-label">หน่วย</div>
+                              <div className="unit-group">
+                                {unitOptions.map(u => (
+                                  <button key={u} className={`unit-btn ${currentEntry.unit === u ? 'active' : ''}`}
+                                    onClick={() => setCurrentEntry(e => e ? { ...e, unit: u } : e)}>{u}</button>
+                                ))}
+                              </div>
+                            </div>
+                            <div>
+                              <div className="section-label">วันผลิต / MFG Date</div>
+                              <DateInputField
+                                value={currentEntry.mfgDate}
+                                onChange={v => setCurrentEntry(e => e ? { ...e, mfgDate: v } : e)}
+                                placeholder="วว/ดด/ปปปป เช่น 01/06/2568"
+                                icon="🏭"
+                              />
+                            </div>
+                            <div>
+                              <div className="section-label">วันหมดอายุ / EXP Date</div>
+                              <DateInputField
+                                value={currentEntry.expDate}
+                                onChange={v => setCurrentEntry(e => e ? { ...e, expDate: v } : e)}
+                                placeholder="วว/ดด/ปปปป เช่น 01/06/2570"
+                                icon="⏰"
+                              />
+                            </div>
+                            <input type="text" className="inp-bare"
+                              placeholder="หมายเหตุ (ถ้ามี)"
+                              value={currentEntry.note}
+                              onChange={ev => setCurrentEntry(e => e ? { ...e, note: ev.target.value } : e)} />
+                            <button className="btn btn-success btn-lg" onClick={handleAddEntry}>
+                              ➕ เพิ่มในลังที่ {currentCaseNumber}
+                            </button>
+                            <button className="btn btn-ghost btn-md"
+                              onClick={() => { setCurrentEntry(null); setManualBarcode(''); setScanning(true) }}>
+                              📷 สแกนใหม่
+                            </button>
                           </div>
-                        ))}
-                      </div>
+                        </div>
+                      )}
 
-                      {/* CTA: finish this case → save to DB + go to next */}
-                      <div style={{ padding: '12px 14px', display: 'flex', flexDirection: 'column', gap: 8 }}>
-                        <button
-                          className="btn-case-done"
-                          onClick={handleCaseDone}
-                          disabled={savingCase}>
-                          {savingCase
-                            ? '⏳ กำลังบันทึก...'
-                            : `✅ ลังที่ ${currentCaseNumber} เสร็จแล้ว — บันทึก & ไปลังที่ ${currentCaseNumber + 1}`}
-                        </button>
-                        {/* continue scanning without finishing case yet */}
-                        {!scanning && !currentEntry && (
-                          <button className="btn btn-ghost btn-md" onClick={() => setScanning(true)}>
-                            📷 สแกนสินค้าเพิ่มในลังนี้
+                      {/* Pending Entries for current case */}
+                      {currentEntries.length > 0 && (
+                        <div className="card">
+                          <div className="card-header">
+                            <h2>📦 รายการในลังที่ {currentCaseNumber}</h2>
+                            <span className="badge" style={{ color: '#f59e0b', borderColor: 'rgba(245,158,11,0.3)', background: 'rgba(245,158,11,0.1)' }}>
+                              {currentEntries.length} รายการ
+                            </span>
+                          </div>
+                          <div className="scroll-area">
+                            {currentEntries.map((e, idx) => (
+                              <div key={idx} className="entry-item">
+                                <div style={{ flex: 1 }}>
+                                  <div className="entry-name">{e.priceItem.item_name}</div>
+                                  <div className="entry-meta">
+                                    {e.quantity} {e.unit}
+                                    {e.mfgDate ? ` · MFG ${e.mfgDate}` : ''}
+                                    {e.expDate ? ` · EXP ${e.expDate}` : ''}
+                                    {e.note ? ` · ${e.note}` : ''}
+                                  </div>
+                                </div>
+                                <button className="btn btn-danger btn-sm" onClick={() => handleDeleteEntry(idx)}>🗑</button>
+                              </div>
+                            ))}
+                          </div>
+                          {/* ไปลังถัดไป — ยังไม่ save */}
+                          <div style={{ padding: '12px 14px', display: 'flex', flexDirection: 'column', gap: 8 }}>
+                            <button
+                              className="btn-next-case"
+                              onClick={handleNextCase}>
+                              📦 ลังที่ {currentCaseNumber} เสร็จแล้ว — ไปลังที่ {currentCaseNumber + 1}
+                            </button>
+                            {!scanning && !currentEntry && (
+                              <button className="btn btn-ghost btn-md" onClick={() => setScanning(true)}>
+                                📷 สแกนสินค้าเพิ่มในลังนี้
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* ปุ่มข้ามลัง (กรณีไม่มีรายการ) */}
+                      {currentEntries.length === 0 && !currentEntry && !notFound && !scanning && sessionConfirmed && (
+                        <div style={{ display: 'flex', gap: 8 }}>
+                          <button className="btn btn-ghost btn-md" style={{ flex: 1 }} onClick={() => setScanning(true)}>
+                            📷 สแกนต่อ
                           </button>
-                        )}
-                      </div>
-                    </div>
-                  )}
+                          <button className="btn btn-ghost btn-md"
+                            style={{ flex: 1, color: '#f59e0b', borderColor: 'rgba(245,158,11,0.3)' }}
+                            onClick={handleNextCase}>
+                            ข้ามไปลังที่ {currentCaseNumber + 1}
+                          </button>
+                        </div>
+                      )}
 
-                  {/* If no entries yet, show shortcut to finish empty case / move to next */}
-                  {entries.length === 0 && !currentEntry && !notFound && !scanning && sessionConfirmed && (
-                    <div style={{ display: 'flex', gap: 8 }}>
-                      <button className="btn btn-ghost btn-md" style={{ flex: 1 }} onClick={() => setScanning(true)}>
-                        📷 สแกนต่อ
-                      </button>
-                      <button className="btn btn-ghost btn-md" style={{ flex: 1, color: '#f59e0b', borderColor: 'rgba(245,158,11,0.3)' }}
-                        onClick={handleCaseDone}>
-                        ข้ามไปลังที่ {currentCaseNumber + 1}
-                      </button>
-                    </div>
+                      {/* ══ ปุ่มยืนยันบันทึกทั้งหัวข้อ ══ */}
+                      {totalEntriesCount > 0 && (
+                        <div style={{ marginTop: 4 }}>
+                          <button
+                            className="btn-session-save"
+                            onClick={() => { stopCamera(); setScanning(false); setShowConfirmSave(true) }}>
+                            ✅ ดูสรุปและบันทึกทั้งหัวข้อ ({totalEntriesCount} รายการ · {allCases.size} ลัง)
+                          </button>
+                        </div>
+                      )}
+                    </>
                   )}
                 </>
               )}
@@ -1310,6 +1407,7 @@ export default function ScanPage() {
                         <div key={label}>
                           <div className="group-header">
                             📋 {label} · {items.length} รายการ
+                            {items[0]?.total_cases ? ` · ${items[0].total_cases} ลัง` : ''}
                             {items[0]?.pallet_image_url && (
                               <img src={items[0].pallet_image_url} alt="pallet"
                                 style={{ display: 'inline-block', verticalAlign: 'middle', marginLeft: 8, width: 28, height: 28, borderRadius: 6, objectFit: 'cover', cursor: 'pointer' }}
@@ -1381,7 +1479,7 @@ export default function ScanPage() {
                   <div className="share-tip">
                     💡 <strong>วิธีแชร์ไป LINE:</strong> กดปุ่มแชร์ → เลือก LINE → เลือกแชทหรือกลุ่มที่ต้องการ<br/>
                     ไฟล์ CSV เปิดได้ด้วย Excel หรือ Google Sheets<br/>
-                    คอลัมน์ <strong>ลังที่</strong> จะแสดงแยกชัดเจนแต่ละลัง
+                    คอลัมน์ <strong>ลังที่</strong> และ <strong>จำนวนลังทั้งหมด</strong> จะแสดงแยกชัดเจนแต่ละลัง
                   </div>
                 </div>
               </div>
@@ -1422,6 +1520,7 @@ export default function ScanPage() {
                           <div key={label}>
                             <div className="group-header">
                               📋 {label} · {items.length} รายการ
+                              {items[0]?.total_cases ? ` · ${items[0].total_cases} ลัง` : ''}
                               {items[0]?.pallet_image_url && (
                                 <img src={items[0].pallet_image_url} alt="pallet"
                                   style={{ display: 'inline-block', verticalAlign: 'middle', marginLeft: 8, width: 28, height: 28, borderRadius: 6, objectFit: 'cover', border: '1px solid rgba(52,211,153,0.3)', cursor: 'pointer' }}
