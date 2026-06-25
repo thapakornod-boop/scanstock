@@ -57,27 +57,99 @@ type ScanLog = {
   created_at: string
 }
 
-// ── Auto-format date input (dd/mm/yyyy) ──
-function useDateInput(initial = '') {
-  const [value, setValue] = useState(initial)
+// ── Date Input: controlled, no re-render keyboard-dismiss trick ──
+// Key insight: use uncontrolled input with ref + only format on blur or manual trigger
+// to prevent iOS keyboard dismiss on setState during typing
+function DateInputField({
+  value,
+  onChange,
+  placeholder,
+  icon,
+}: {
+  value: string
+  onChange: (v: string) => void
+  placeholder: string
+  icon: string
+}) {
+  const inputRef = useRef<HTMLInputElement>(null)
+  // Keep internal raw digits separate from displayed value
+  // so we don't re-render (and thus dismiss keyboard) mid-typing
+  const rawDigitsRef = useRef(value.replace(/\D/g, ''))
 
-  const handleChange = useCallback((raw: string) => {
-    // Strip non-digits
-    const digits = raw.replace(/\D/g, '')
-    let formatted = ''
-    if (digits.length <= 2) {
-      formatted = digits
-    } else if (digits.length <= 4) {
-      formatted = digits.slice(0, 2) + '/' + digits.slice(2)
-    } else {
-      formatted = digits.slice(0, 2) + '/' + digits.slice(2, 4) + '/' + digits.slice(4, 8)
+  // Sync external value → raw digits when changed from outside (e.g. reset)
+  useEffect(() => {
+    rawDigitsRef.current = value.replace(/\D/g, '')
+    if (inputRef.current && document.activeElement !== inputRef.current) {
+      inputRef.current.value = value
     }
-    setValue(formatted)
-  }, [])
+  }, [value])
 
-  const reset = useCallback(() => setValue(''), [])
+  const formatDigits = (digits: string) => {
+    if (digits.length <= 2) return digits
+    if (digits.length <= 4) return digits.slice(0, 2) + '/' + digits.slice(2)
+    return digits.slice(0, 2) + '/' + digits.slice(2, 4) + '/' + digits.slice(4, 8)
+  }
 
-  return { value, handleChange, reset, setValue }
+  const handleInput = (e: React.FormEvent<HTMLInputElement>) => {
+    const el = e.currentTarget
+    const raw = el.value
+    const digits = raw.replace(/\D/g, '').slice(0, 8)
+    rawDigitsRef.current = digits
+    const formatted = formatDigits(digits)
+    // Update DOM directly without causing React re-render
+    el.value = formatted
+    // Move cursor to end
+    const len = formatted.length
+    try { el.setSelectionRange(len, len) } catch {}
+    // Notify parent - use setTimeout to batch outside render cycle
+    // so iOS doesn't collapse keyboard
+    setTimeout(() => onChange(formatted), 0)
+  }
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Backspace') {
+      e.preventDefault()
+      const el = e.currentTarget
+      const digits = rawDigitsRef.current
+      const newDigits = digits.slice(0, -1)
+      rawDigitsRef.current = newDigits
+      const formatted = formatDigits(newDigits)
+      el.value = formatted
+      try { el.setSelectionRange(formatted.length, formatted.length) } catch {}
+      setTimeout(() => onChange(formatted), 0)
+    }
+  }
+
+  return (
+    <div style={{ position: 'relative' }}>
+      <span style={{
+        position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)',
+        fontSize: 15, pointerEvents: 'none',
+      }}>{icon}</span>
+      <input
+        ref={inputRef}
+        type="text"
+        inputMode="numeric"
+        defaultValue={value}
+        onInput={handleInput}
+        onKeyDown={handleKeyDown}
+        placeholder={placeholder}
+        maxLength={10}
+        style={{
+          width: '100%',
+          background: 'var(--bg3)',
+          border: `1px solid var(--border)`,
+          borderRadius: 10,
+          color: 'var(--text)',
+          fontSize: 16,
+          fontFamily: "'IBM Plex Mono', monospace",
+          padding: '10px 12px 10px 36px',
+          outline: 'none',
+          letterSpacing: '0.04em',
+        }}
+      />
+    </div>
+  )
 }
 
 export default function ScanPage() {
@@ -91,12 +163,13 @@ export default function ScanPage() {
 
   const [tab, setTab] = useState<TabType>('scan')
   const [theme, setTheme] = useState<Theme>('dark')
-  const [scanning, setScanning] = useState(true)
+  const [scanning, setScanning] = useState(false)
+
+  // entries for current case (pending, not yet saved)
   const [entries, setEntries] = useState<ScanEntry[]>([])
   const [currentEntry, setCurrentEntry] = useState<ScanEntry | null>(null)
   const [notFound, setNotFound] = useState(false)
-  const [saving, setSaving] = useState(false)
-  const [savingNow, setSavingNow] = useState(false)
+  const [savingCase, setSavingCase] = useState(false)
   const [successMsg, setSuccessMsg] = useState('')
   const [employeeId, setEmployeeId] = useState('')
   const [employeeName, setEmployeeName] = useState('')
@@ -105,30 +178,27 @@ export default function ScanPage() {
   const [searching, setSearching] = useState(false)
   const [lastSearched, setLastSearched] = useState('')
 
-  // ── Session ──
+  // ── Session (Step 1) ──
   const [sessionLabel, setSessionLabel] = useState('')
   const [sessionConfirmed, setSessionConfirmed] = useState(false)
   const [sessionInput, setSessionInput] = useState('')
 
-  // ── Pallet photo state ──
+  // ── Pallet photo ──
   const [palletPhotoMode, setPalletPhotoMode] = useState<'idle' | 'camera' | 'preview'>('idle')
   const [palletImageDataUrl, setPalletImageDataUrl] = useState<string | null>(null)
   const [palletImageUrl, setPalletImageUrl] = useState<string | null>(null)
   const [palletCameraError, setPalletCameraError] = useState('')
   const [uploadingPhoto, setUploadingPhoto] = useState(false)
 
-  // ── Pallet case count ──
-  const [totalCasesInput, setTotalCasesInput] = useState('')
-  const [totalCases, setTotalCases] = useState<number>(0)
+  // ── Case counter (auto-increment, no pre-declaration) ──
   const [currentCaseNumber, setCurrentCaseNumber] = useState<number>(1)
-  const [caseConfirmed, setCaseConfirmed] = useState(false)
 
+  // ── History / manage ──
   const [logs, setLogs] = useState<ScanLog[]>([])
   const [loadingLogs, setLoadingLogs] = useState(false)
   const [editingLog, setEditingLog] = useState<ScanLog | null>(null)
   const [filterLabel, setFilterLabel] = useState('')
   const [allLabels, setAllLabels] = useState<string[]>([])
-
   const [sharing, setSharing] = useState(false)
   const [shareMsg, setShareMsg] = useState('')
 
@@ -147,7 +217,7 @@ export default function ScanPage() {
     if (savedTheme) setTheme(savedTheme)
   }, [router])
 
-  // ── iOS zoom fix: ensure no input < 16px and viewport is correct ──
+  // ── iOS viewport fix ──
   useEffect(() => {
     const meta = document.querySelector('meta[name="viewport"]')
     if (meta) {
@@ -215,13 +285,19 @@ export default function ScanPage() {
         photoVideoRef.current.setAttribute('playsinline', 'true')
         photoVideoRef.current.muted = true
         photoVideoRef.current.autoplay = true
+        // wait for metadata to be ready before play
+        await new Promise<void>(resolve => {
+          if (!photoVideoRef.current) return resolve()
+          if (photoVideoRef.current.readyState >= 1) return resolve()
+          photoVideoRef.current.onloadedmetadata = () => resolve()
+        })
         await photoVideoRef.current.play().catch(() => {})
       }
     } catch (err: any) {
       stopPhotoCamera()
       if (err.name === 'NotAllowedError') setPalletCameraError('ไม่ได้รับอนุญาตให้ใช้กล้อง')
       else if (err.name === 'NotReadableError') setPalletCameraError('กล้องถูกใช้งานโดยแอปอื่น')
-      else setPalletCameraError(`เกิดข้อผิดพลาด: ${err.name}`)
+      else setPalletCameraError(`เกิดข้อผิดพลาด: ${err.name || err.message}`)
     }
   }, [stopPhotoCamera])
 
@@ -240,6 +316,7 @@ export default function ScanPage() {
     setPalletPhotoMode('preview')
   }, [stopPhotoCamera])
 
+  // ── FIX: upload photo without blocking — returns url directly ──
   const uploadPalletImage = useCallback(async (dataUrl: string): Promise<string | null> => {
     try {
       setUploadingPhoto(true)
@@ -249,7 +326,11 @@ export default function ScanPage() {
       const { data, error } = await supabase.storage
         .from('pallet-photos')
         .upload(fileName, blob, { contentType: 'image/jpeg', upsert: false })
-      if (error) { console.error('Upload error:', error); setUploadingPhoto(false); return null }
+      if (error) {
+        console.error('Upload error:', error)
+        setUploadingPhoto(false)
+        return null
+      }
       const { data: urlData } = supabase.storage.from('pallet-photos').getPublicUrl(data.path)
       setUploadingPhoto(false)
       return urlData.publicUrl
@@ -260,10 +341,14 @@ export default function ScanPage() {
     }
   }, [employeeId, supabase])
 
+  // ── FIX: confirm pallet photo — upload then immediately go to next step ──
   const handleConfirmPalletPhoto = useCallback(async () => {
     if (!palletImageDataUrl) return
+    setUploadingPhoto(true)
     const url = await uploadPalletImage(palletImageDataUrl)
+    // Even if upload failed, still proceed (url will be null)
     setPalletImageUrl(url)
+    setUploadingPhoto(false)
     setPalletPhotoMode('idle')
   }, [palletImageDataUrl, uploadPalletImage])
 
@@ -275,7 +360,7 @@ export default function ScanPage() {
   useEffect(() => {
     if (tab === 'history' || tab === 'manage') fetchLogs()
     if (tab !== 'scan') { stopCamera(); setScanning(false) }
-    if (tab === 'scan') setScanning(true)
+    if (tab === 'scan' && sessionConfirmed) setScanning(true)
   }, [tab])
 
   const fetchLogs = async () => {
@@ -291,9 +376,9 @@ export default function ScanPage() {
     setLoadingLogs(false)
   }
 
-  // ── Barcode camera useEffect ──
+  // ── Barcode camera ──
   useEffect(() => {
-    if (!scanning || !sessionConfirmed || !caseConfirmed) return
+    if (!scanning || !sessionConfirmed) return
     setCameraError('')
     let cancelled = false
     const startCamera = async () => {
@@ -354,7 +439,7 @@ export default function ScanPage() {
     }
     startCamera()
     return () => { cancelled = true; stopCamera() }
-  }, [scanning, sessionConfirmed, caseConfirmed, stopCamera])
+  }, [scanning, sessionConfirmed, stopCamera])
 
   const fetchByBarcode = async (barcode: string) => {
     setNotFound(false); setCurrentEntry(null)
@@ -399,36 +484,7 @@ export default function ScanPage() {
     setSearching(false)
   }
 
-  const buildRecord = (e: ScanEntry, caseNum: number, total: number) => ({
-    employee_id: employeeId,
-    employee_name: employeeName,
-    barcode: e.barcodeType === 'piece' ? e.priceItem.barcode_piece : e.barcodeType === 'case' ? e.priceItem.barcode_case : e.priceItem.barcode_pack,
-    item_code: e.priceItem.item_code,
-    product_name: e.priceItem.item_name,
-    brand: e.priceItem.brand,
-    size: e.priceItem.size,
-    unit: e.unit,
-    quantity: e.quantity,
-    note: e.note,
-    session_label: sessionLabel,
-    pallet_image_url: palletImageUrl || null,
-    mfg_date: e.mfgDate || null,
-    exp_date: e.expDate || null,
-    case_number: caseNum,
-    total_cases: total,
-  })
-
-  const handleSaveNow = async () => {
-    if (!currentEntry || !employeeId) return
-    setSavingNow(true)
-    const record = buildRecord(currentEntry, currentCaseNumber, totalCases)
-    const { error } = await supabase.from('scan_logs').insert([record]).select()
-    if (error) { console.error('code:', error.code, 'message:', error.message); setSavingNow(false); return }
-    setSavingNow(false); setCurrentEntry(null); setNotFound(false); setManualBarcode('')
-    setSuccessMsg(`✅ บันทึกสำเร็จ — ลัง ${currentCaseNumber}/${totalCases}`)
-    setTimeout(() => { setSuccessMsg(''); setScanning(true) }, 1800)
-  }
-
+  // ── Add current entry to pending list for this case ──
   const handleAddEntry = () => {
     if (!currentEntry) return
     setEntries(prev => [...prev, currentEntry])
@@ -436,32 +492,48 @@ export default function ScanPage() {
     setTimeout(() => setScanning(true), 300)
   }
 
-  const handleSaveAll = async () => {
-    if (entries.length === 0 || !employeeId) return
-    setSaving(true)
-    const records = entries.map(e => buildRecord(e, currentCaseNumber, totalCases))
-    const { error } = await supabase.from('scan_logs').insert(records)
-    if (error) { console.error(String(error)); setSaving(false); return }
-    setSuccessMsg(`✅ บันทึกสำเร็จ ${records.length} รายการ (ลัง ${currentCaseNumber}/${totalCases})`)
-    setEntries([]); setSaving(false)
-    setTimeout(() => setSuccessMsg(''), 3000)
-  }
-
-  // ── Confirm current case done, move to next ──
-  const handleCaseDone = () => {
-    if (currentCaseNumber >= totalCases) {
-      // All cases done
-      setSuccessMsg(`✅ ครบทุกลัง ${totalCases}/${totalCases} แล้ว!`)
-      setTimeout(() => setSuccessMsg(''), 3000)
+  // ── Save all pending entries for current case → DB, then increment case number ──
+  const handleCaseDone = async () => {
+    if (entries.length === 0) {
+      // No items but user wants to move to next case
+      setCurrentCaseNumber(n => n + 1)
+      setCurrentEntry(null)
+      setNotFound(false)
+      setManualBarcode('')
+      setScanning(true)
       return
     }
-    const next = currentCaseNumber + 1
-    setCurrentCaseNumber(next)
+    setSavingCase(true)
+    const records = entries.map(e => ({
+      employee_id: employeeId,
+      employee_name: employeeName,
+      barcode: e.barcodeType === 'piece' ? e.priceItem.barcode_piece
+             : e.barcodeType === 'case'  ? e.priceItem.barcode_case
+             : e.priceItem.barcode_pack,
+      item_code: e.priceItem.item_code,
+      product_name: e.priceItem.item_name,
+      brand: e.priceItem.brand,
+      size: e.priceItem.size,
+      unit: e.unit,
+      quantity: e.quantity,
+      note: e.note,
+      session_label: sessionLabel,
+      pallet_image_url: palletImageUrl || null,
+      mfg_date: e.mfgDate || null,
+      exp_date: e.expDate || null,
+      case_number: currentCaseNumber,
+      total_cases: null, // unknown total, filled later or left null
+    }))
+    const { error } = await supabase.from('scan_logs').insert(records)
+    if (error) { console.error(error); setSavingCase(false); return }
+    const savedCase = currentCaseNumber
+    setEntries([])
     setCurrentEntry(null)
     setNotFound(false)
     setManualBarcode('')
-    setEntries([])
-    setSuccessMsg(`✅ ลังที่ ${currentCaseNumber} เสร็จแล้ว → เริ่มลังที่ ${next}/${totalCases}`)
+    setCurrentCaseNumber(n => n + 1)
+    setSavingCase(false)
+    setSuccessMsg(`✅ บันทึกลังที่ ${savedCase} แล้ว ${records.length} รายการ → เริ่มลังที่ ${savedCase + 1}`)
     setTimeout(() => { setSuccessMsg(''); setScanning(true) }, 1800)
   }
 
@@ -492,11 +564,10 @@ export default function ScanPage() {
     return filtered
   }
 
-  // ── CSV ──
   const buildCsvBlob = (filtered: ScanLog[]): Blob => {
-    const header = 'วันที่,รหัสพนักงาน,ชื่อพนักงาน,หัวข้อ,ลังที่,จากลังทั้งหมด,รหัสสินค้า,ชื่อสินค้า,แบรนด์,ขนาด,จำนวน,หน่วย,วันผลิต,วันหมดอายุ,หมายเหตุ,รูปพาเลท\n'
+    const header = 'วันที่,รหัสพนักงาน,ชื่อพนักงาน,หัวข้อ,ลังที่,รหัสสินค้า,ชื่อสินค้า,แบรนด์,ขนาด,จำนวน,หน่วย,วันผลิต,วันหมดอายุ,หมายเหตุ,รูปพาเลท\n'
     const rows = filtered.map(l =>
-      `${new Date(l.created_at).toLocaleString('th-TH')},${l.employee_id},${l.employee_name},${l.session_label || ''},${l.case_number ?? ''},${l.total_cases ?? ''},${l.item_code},${l.product_name},${l.brand},${l.size},${l.quantity},${l.unit},${l.mfg_date || ''},${l.exp_date || ''},${l.note},${l.pallet_image_url || ''}`
+      `${new Date(l.created_at).toLocaleString('th-TH')},${l.employee_id},${l.employee_name},${l.session_label || ''},${l.case_number ?? ''},${l.item_code},${l.product_name},${l.brand},${l.size},${l.quantity},${l.unit},${l.mfg_date || ''},${l.exp_date || ''},${l.note},${l.pallet_image_url || ''}`
     ).join('\n')
     return new Blob(['\uFEFF' + header + rows], { type: 'text/csv;charset=utf-8;' })
   }
@@ -527,7 +598,7 @@ export default function ScanPage() {
     const canShareFile = supportsShare && typeof navigator.canShare === 'function' && navigator.canShare({ files: [file] })
     if (canShareFile) {
       try {
-        await navigator.share({ title: `RSM สแกนสต็อก`, text: `ข้อมูลสแกนสต็อก ${filtered.length} รายการ`, files: [file] })
+        await navigator.share({ title: 'RSM สแกนสต็อก', text: `ข้อมูลสแกนสต็อก ${filtered.length} รายการ`, files: [file] })
         setShareMsg('✅ แชร์สำเร็จ')
       } catch (err: any) {
         if (err?.name !== 'AbortError') { handleDownload(); setShareMsg('ℹ️ ดาวน์โหลดไฟล์ให้แล้ว') }
@@ -551,24 +622,24 @@ export default function ScanPage() {
   }
 
   const darkVars = `
-    --bg: #0a0d14; --bg2: #121623; --bg3: #0a0d14;
-    --border: #1e2235; --border2: #161924;
-    --text: #e2e8f0; --text2: #cbd5e1; --text3: #94a3b8; --text4: #475569; --text5: #334155;
-    --accent: #38bdf8; --accent2: #0ea5e9;
-    --hdr-bg: rgba(16,20,32,0.95); --cam-hint: #475569; --meta-label: #334155;
-    --log-date: #2a3044; --tab-active-bg: rgba(56,189,248,0.04);
-    --edit-bg: #0d1018;
-    --stock-bg: rgba(56,189,248,0.05); --stock-border: rgba(56,189,248,0.12);
+    --bg:#0a0d14;--bg2:#121623;--bg3:#0a0d14;
+    --border:#1e2235;--border2:#161924;
+    --text:#e2e8f0;--text2:#cbd5e1;--text3:#94a3b8;--text4:#475569;--text5:#334155;
+    --accent:#38bdf8;--accent2:#0ea5e9;
+    --hdr-bg:rgba(16,20,32,0.95);--cam-hint:#475569;--meta-label:#334155;
+    --log-date:#2a3044;--tab-active-bg:rgba(56,189,248,0.04);
+    --edit-bg:#0d1018;
+    --stock-bg:rgba(56,189,248,0.05);--stock-border:rgba(56,189,248,0.12);
   `
   const lightVars = `
-    --bg: #f1f5f9; --bg2: #ffffff; --bg3: #f8fafc;
-    --border: #e2e8f0; --border2: #e8ecf0;
-    --text: #0f172a; --text2: #1e293b; --text3: #475569; --text4: #64748b; --text5: #94a3b8;
-    --accent: #0284c7; --accent2: #0369a1;
-    --hdr-bg: rgba(255,255,255,0.95); --cam-hint: #64748b; --meta-label: #94a3b8;
-    --log-date: #94a3b8; --tab-active-bg: rgba(2,132,199,0.06);
-    --edit-bg: #f8fafc;
-    --stock-bg: rgba(2,132,199,0.04); --stock-border: rgba(2,132,199,0.14);
+    --bg:#f1f5f9;--bg2:#ffffff;--bg3:#f8fafc;
+    --border:#e2e8f0;--border2:#e8ecf0;
+    --text:#0f172a;--text2:#1e293b;--text3:#475569;--text4:#64748b;--text5:#94a3b8;
+    --accent:#0284c7;--accent2:#0369a1;
+    --hdr-bg:rgba(255,255,255,0.95);--cam-hint:#64748b;--meta-label:#94a3b8;
+    --log-date:#94a3b8;--tab-active-bg:rgba(2,132,199,0.06);
+    --edit-bg:#f8fafc;
+    --stock-bg:rgba(2,132,199,0.04);--stock-border:rgba(2,132,199,0.14);
   `
 
   // ── Stock Panel ──
@@ -577,18 +648,18 @@ export default function ScanPage() {
     if (!hasStock) return null
     return (
       <div style={{ background: 'var(--stock-bg)', border: '1px solid var(--stock-border)', borderRadius: 12, padding: '11px 14px', display: 'flex', flexDirection: 'column', gap: 8 }}>
-        <div style={{ fontSize: 10, fontFamily: "'IBM Plex Mono', monospace", letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--text4)', marginBottom: 2 }}>📦 ข้อมูลสต็อกปัจจุบัน</div>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8 }}>
+        <div style={{ fontSize: 10, fontFamily: "'IBM Plex Mono',monospace", letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--text4)', marginBottom: 2 }}>📦 ข้อมูลสต็อกปัจจุบัน</div>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3,1fr)', gap: 8 }}>
           {([['On Hand', item.on_hand, 'ชิ้น'], ['ลัง', item.in_stock_cases, 'ลัง'], ['ชิ้น', item.in_stock_pieces, 'ชิ้น']] as [string, number | null, string][]).map(([label, value, unit]) => (
             <div key={label} style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 9, padding: '8px 10px', textAlign: 'center' }}>
-              <div style={{ fontSize: 10, color: 'var(--meta-label)', fontFamily: "'IBM Plex Mono', monospace", letterSpacing: '0.05em', marginBottom: 4 }}>{label}</div>
-              <div style={{ fontSize: 18, fontWeight: 700, fontFamily: "'IBM Plex Mono', monospace", color: stockColor(value), lineHeight: 1 }}>{value === null ? '—' : value}</div>
+              <div style={{ fontSize: 10, color: 'var(--meta-label)', fontFamily: "'IBM Plex Mono',monospace", letterSpacing: '0.05em', marginBottom: 4 }}>{label}</div>
+              <div style={{ fontSize: 18, fontWeight: 700, fontFamily: "'IBM Plex Mono',monospace", color: stockColor(value), lineHeight: 1 }}>{value === null ? '—' : value}</div>
               {value !== null && <div style={{ fontSize: 10, color: 'var(--text5)', marginTop: 3 }}>{unit}</div>}
             </div>
           ))}
         </div>
         {item.stock_value !== null && (
-          <div style={{ fontSize: 11, color: 'var(--text4)', fontFamily: "'IBM Plex Mono', monospace", textAlign: 'right', marginTop: 2 }}>
+          <div style={{ fontSize: 11, color: 'var(--text4)', fontFamily: "'IBM Plex Mono',monospace", textAlign: 'right', marginTop: 2 }}>
             มูลค่า: <span style={{ color: 'var(--text2)', fontWeight: 600 }}>฿{item.stock_value.toLocaleString('th-TH', { minimumFractionDigits: 2 })}</span>
           </div>
         )}
@@ -596,70 +667,23 @@ export default function ScanPage() {
     )
   }
 
-  // ── Date Input Component (dd/mm/yyyy auto-slash) ──
-  const DateInput = ({
-    value,
-    onChange,
-    placeholder,
-    icon,
-  }: {
-    value: string
-    onChange: (v: string) => void
-    placeholder: string
-    icon: string
-  }) => {
-    const handleKey = (e: React.ChangeEvent<HTMLInputElement>) => {
-      const digits = e.target.value.replace(/\D/g, '')
-      let formatted = ''
-      if (digits.length <= 2) {
-        formatted = digits
-      } else if (digits.length <= 4) {
-        formatted = digits.slice(0, 2) + '/' + digits.slice(2)
-      } else {
-        formatted = digits.slice(0, 2) + '/' + digits.slice(2, 4) + '/' + digits.slice(4, 8)
-      }
-      onChange(formatted)
-    }
-    return (
-      <div style={{ position: 'relative' }}>
-        <span style={{ position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)', fontSize: 15, pointerEvents: 'none' }}>{icon}</span>
-        <input
-          type="text"
-          inputMode="numeric"
-          value={value}
-          onChange={handleKey}
-          placeholder={placeholder}
-          maxLength={10}
-          style={{
-            width: '100%',
-            background: 'var(--bg3)',
-            border: `1px solid ${value ? 'var(--accent)' : 'var(--border)'}`,
-            borderRadius: 10,
-            color: value ? 'var(--accent)' : 'var(--text)',
-            fontSize: 16, // 16px prevents iOS zoom
-            fontFamily: "'IBM Plex Mono', monospace",
-            padding: '10px 12px 10px 36px',
-            outline: 'none',
-            fontWeight: value ? 600 : 400,
-            letterSpacing: value ? '0.06em' : 'normal',
-            transition: 'border-color 0.15s',
-          }}
-        />
-      </div>
-    )
-  }
-
-  // ── Pallet Photo UI Section ──
+  // ── Pallet Photo Section ──
   const PalletPhotoSection = () => (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-      <div style={{ fontSize: 11, color: 'var(--text4)', fontFamily: "'IBM Plex Mono', monospace", letterSpacing: '0.06em', textTransform: 'uppercase' }}>
-        📸 รูปถ่ายพาเลท (ไม่บังคับ)
+      <div style={{ fontSize: 11, color: 'var(--text4)', fontFamily: "'IBM Plex Mono',monospace", letterSpacing: '0.06em', textTransform: 'uppercase' }}>
+        📸 ถ่ายรูปพาเลท (ไม่บังคับ)
       </div>
-      {palletPhotoMode === 'idle' && !palletImageDataUrl && (
-        <button type="button" className="btn btn-ghost btn-md" style={{ width: '100%', border: `2px dashed var(--border)`, borderRadius: 12, padding: '16px', fontSize: 16 }} onClick={() => setPalletPhotoMode('camera')}>
+
+      {/* idle + no photo yet */}
+      {palletPhotoMode === 'idle' && !palletImageDataUrl && !palletImageUrl && (
+        <button type="button" className="btn btn-ghost btn-md"
+          style={{ width: '100%', border: '2px dashed var(--border)', borderRadius: 12, padding: 16, fontSize: 16 }}
+          onClick={() => setPalletPhotoMode('camera')}>
           📷 ถ่ายรูปพาเลท
         </button>
       )}
+
+      {/* camera active */}
       {palletPhotoMode === 'camera' && (
         <div style={{ borderRadius: 12, overflow: 'hidden', border: '1px solid var(--border)' }}>
           {palletCameraError ? (
@@ -671,13 +695,15 @@ export default function ScanPage() {
           ) : (
             <>
               <div style={{ position: 'relative', background: '#000', aspectRatio: '4/3' }}>
-                <video ref={photoVideoRef} playsInline muted autoPlay style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />
+                <video ref={photoVideoRef} playsInline muted autoPlay
+                  style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />
                 {(['tl','tr','bl','br'] as const).map(pos => (
-                  <div key={pos} style={{ position: 'absolute', width: 22, height: 22, borderColor: '#34d399', borderStyle: 'solid', opacity: 0.9,
-                    ...(pos === 'tl' ? { top: 14, left: 14, borderWidth: '3px 0 0 3px', borderRadius: '3px 0 0 0' } :
-                       pos === 'tr' ? { top: 14, right: 14, borderWidth: '3px 3px 0 0', borderRadius: '0 3px 0 0' } :
-                       pos === 'bl' ? { bottom: 14, left: 14, borderWidth: '0 0 3px 3px', borderRadius: '0 0 0 3px' } :
-                                      { bottom: 14, right: 14, borderWidth: '0 3px 3px 0', borderRadius: '0 0 3px 0' })
+                  <div key={pos} style={{
+                    position: 'absolute', width: 22, height: 22, borderColor: '#34d399', borderStyle: 'solid', opacity: 0.9,
+                    ...(pos==='tl' ? {top:14,left:14,borderWidth:'3px 0 0 3px',borderRadius:'3px 0 0 0'}
+                      : pos==='tr' ? {top:14,right:14,borderWidth:'3px 3px 0 0',borderRadius:'0 3px 0 0'}
+                      : pos==='bl' ? {bottom:14,left:14,borderWidth:'0 0 3px 3px',borderRadius:'0 0 0 3px'}
+                      :              {bottom:14,right:14,borderWidth:'0 3px 3px 0',borderRadius:'0 0 3px 0'})
                   }} />
                 ))}
               </div>
@@ -690,98 +716,78 @@ export default function ScanPage() {
           )}
         </div>
       )}
+
+      {/* preview captured photo */}
       {palletPhotoMode === 'preview' && palletImageDataUrl && (
         <div style={{ borderRadius: 12, overflow: 'hidden', border: '1px solid var(--border)' }}>
-          <img src={palletImageDataUrl} alt="pallet preview" style={{ width: '100%', display: 'block', aspectRatio: '4/3', objectFit: 'cover' }} />
+          <img src={palletImageDataUrl} alt="pallet preview"
+            style={{ width: '100%', display: 'block', aspectRatio: '4/3', objectFit: 'cover' }} />
           <div style={{ display: 'flex', gap: 8, padding: '10px 12px', background: 'var(--bg3)' }}>
-            <button className="btn btn-primary btn-md" style={{ flex: 1 }} onClick={handleConfirmPalletPhoto} disabled={uploadingPhoto}>
+            <button className="btn btn-primary btn-md" style={{ flex: 1 }}
+              onClick={handleConfirmPalletPhoto}
+              disabled={uploadingPhoto}>
               {uploadingPhoto ? '⏳ กำลังอัปโหลด...' : '✅ ใช้รูปนี้'}
             </button>
-            <button className="btn btn-ghost btn-md" onClick={() => { setPalletImageDataUrl(null); setPalletPhotoMode('camera') }}>🔄 ถ่ายใหม่</button>
+            <button className="btn btn-ghost btn-md"
+              onClick={() => { setPalletImageDataUrl(null); setPalletPhotoMode('camera') }}>
+              🔄 ถ่ายใหม่
+            </button>
           </div>
         </div>
       )}
+
+      {/* photo confirmed & uploaded */}
       {palletPhotoMode === 'idle' && palletImageUrl && (
         <div style={{ borderRadius: 12, overflow: 'hidden', border: '1px solid rgba(52,211,153,0.3)' }}>
-          <img src={palletImageUrl} alt="pallet" style={{ width: '100%', display: 'block', aspectRatio: '4/3', objectFit: 'cover' }} />
+          <img src={palletImageUrl} alt="pallet"
+            style={{ width: '100%', display: 'block', aspectRatio: '4/3', objectFit: 'cover' }} />
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', background: 'rgba(52,211,153,0.06)' }}>
             <span style={{ fontSize: 13, color: '#34d399', fontWeight: 600 }}>✅ บันทึกรูปพาเลทแล้ว</span>
-            <button className="btn btn-ghost btn-sm" onClick={() => { setPalletImageUrl(null); setPalletImageDataUrl(null); setPalletPhotoMode('camera') }}>🔄 เปลี่ยนรูป</button>
+            <button className="btn btn-ghost btn-sm"
+              onClick={() => { setPalletImageUrl(null); setPalletImageDataUrl(null); setPalletPhotoMode('camera') }}>
+              🔄 เปลี่ยนรูป
+            </button>
           </div>
         </div>
       )}
+
+      {/* captured but not yet uploaded (edge case) */}
       {palletPhotoMode === 'idle' && palletImageDataUrl && !palletImageUrl && (
         <div style={{ borderRadius: 12, overflow: 'hidden', border: '1px solid var(--border)' }}>
-          <img src={palletImageDataUrl} alt="pallet preview" style={{ width: '100%', display: 'block', aspectRatio: '4/3', objectFit: 'cover' }} />
+          <img src={palletImageDataUrl} alt="pallet preview"
+            style={{ width: '100%', display: 'block', aspectRatio: '4/3', objectFit: 'cover' }} />
           <div style={{ display: 'flex', gap: 8, padding: '8px 12px', background: 'var(--bg3)' }}>
-            <button className="btn btn-primary btn-md" style={{ flex: 1 }} onClick={handleConfirmPalletPhoto} disabled={uploadingPhoto}>
+            <button className="btn btn-primary btn-md" style={{ flex: 1 }}
+              onClick={handleConfirmPalletPhoto}
+              disabled={uploadingPhoto}>
               {uploadingPhoto ? '⏳ กำลังอัปโหลด...' : '✅ ยืนยันใช้รูปนี้'}
             </button>
-            <button className="btn btn-ghost btn-md" onClick={() => { setPalletImageDataUrl(null); setPalletPhotoMode('camera') }}>🔄 ถ่ายใหม่</button>
+            <button className="btn btn-ghost btn-md"
+              onClick={() => { setPalletImageDataUrl(null); setPalletPhotoMode('camera') }}>
+              🔄 ถ่ายใหม่
+            </button>
           </div>
         </div>
       )}
     </div>
   )
 
-  // ── Case Progress Bar ──
-  const CaseProgressBar = () => (
+  // ── Case status pill ──
+  const CasePill = () => (
     <div style={{
-      background: isDark ? 'rgba(56,189,248,0.06)' : 'rgba(2,132,199,0.05)',
-      border: `1px solid ${isDark ? 'rgba(56,189,248,0.18)' : 'rgba(2,132,199,0.18)'}`,
-      borderRadius: 14,
-      padding: '12px 16px',
-      display: 'flex',
-      flexDirection: 'column',
-      gap: 10,
+      display: 'inline-flex', alignItems: 'center', gap: 8,
+      background: isDark ? 'rgba(245,158,11,0.1)' : 'rgba(245,158,11,0.08)',
+      border: '1px solid rgba(245,158,11,0.3)',
+      borderRadius: 20, padding: '6px 14px',
     }}>
-      {/* Header row */}
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-        <span style={{ fontSize: 12, color: 'var(--text4)', fontFamily: "'IBM Plex Mono', monospace", letterSpacing: '0.06em', textTransform: 'uppercase' }}>
-          ลังที่กำลังนับ
+      <span style={{ fontSize: 14, color: '#f59e0b', fontFamily: "'IBM Plex Mono',monospace", fontWeight: 700 }}>
+        📦 ลังที่ {currentCaseNumber}
+      </span>
+      {entries.length > 0 && (
+        <span style={{ fontSize: 12, color: 'var(--text4)', fontFamily: "'IBM Plex Mono',monospace" }}>
+          · {entries.length} รายการ
         </span>
-        <span style={{ fontSize: 22, fontWeight: 800, fontFamily: "'IBM Plex Mono', monospace", color: 'var(--accent)', letterSpacing: '-0.02em' }}>
-          {currentCaseNumber}<span style={{ fontSize: 13, fontWeight: 500, color: 'var(--text4)' }}>/{totalCases}</span>
-        </span>
-      </div>
-
-      {/* Progress bar */}
-      <div style={{ height: 6, background: 'var(--border)', borderRadius: 99, overflow: 'hidden' }}>
-        <div style={{
-          height: '100%',
-          width: `${(currentCaseNumber / totalCases) * 100}%`,
-          background: 'linear-gradient(90deg, var(--accent2), var(--accent))',
-          borderRadius: 99,
-          transition: 'width 0.4s ease',
-        }} />
-      </div>
-
-      {/* Dot indicators — show max 10 */}
-      {totalCases <= 20 && (
-        <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
-          {Array.from({ length: totalCases }, (_, i) => i + 1).map(n => (
-            <div key={n} style={{
-              width: 20, height: 20, borderRadius: 6,
-              background: n < currentCaseNumber ? '#10b981' : n === currentCaseNumber ? 'var(--accent2)' : 'var(--border)',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              fontSize: 9, fontWeight: 700, color: n <= currentCaseNumber ? '#fff' : 'var(--text5)',
-              fontFamily: "'IBM Plex Mono', monospace",
-              transition: 'background 0.3s',
-            }}>
-              {n < currentCaseNumber ? '✓' : n}
-            </div>
-          ))}
-        </div>
       )}
-
-      <button
-        className="btn btn-ghost btn-sm"
-        style={{ alignSelf: 'flex-end', fontSize: 12, color: '#34d399', borderColor: 'rgba(52,211,153,0.3)' }}
-        onClick={handleCaseDone}
-        disabled={currentCaseNumber > totalCases}
-      >
-        {currentCaseNumber >= totalCases ? '🏁 ครบทุกลังแล้ว' : `✅ ลังที่ ${currentCaseNumber} เสร็จ → ลังที่ ${currentCaseNumber + 1}`}
-      </button>
     </div>
   )
 
@@ -789,196 +795,158 @@ export default function ScanPage() {
     <>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
-        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-        html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
-        html, body { overflow-x: hidden; width: 100%; }
-        body { font-family: 'Sarabun', sans-serif; background: var(--bg); color: var(--text); }
+        *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
+        html{-webkit-text-size-adjust:100%;text-size-adjust:100%;}
+        html,body{overflow-x:hidden;width:100%;}
+        body{font-family:'Sarabun',sans-serif;background:var(--bg);color:var(--text);}
+        input,select,textarea{font-size:16px!important;}
 
-        /* ── iOS zoom fix: all inputs must be >= 16px ── */
-        input, select, textarea { font-size: 16px !important; }
+        .scan-root{min-height:100dvh;width:100%;background:var(--bg);${isDark?darkVars:lightVars}}
 
-        .scan-root {
-          min-height: 100dvh; width: 100%; background: var(--bg);
-          ${isDark ? darkVars : lightVars}
+        .hdr{background:var(--hdr-bg);border-bottom:1px solid var(--border);padding:11px 18px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);}
+        .hdr-left{display:flex;align-items:center;gap:12px;}
+        .hdr-right{display:flex;align-items:center;gap:8px;}
+        .hdr-name{font-size:13px;font-weight:600;color:var(--text2);line-height:1.2;}
+        .hdr-id{font-size:11px;color:var(--accent);font-family:'IBM Plex Mono',monospace;letter-spacing:0.04em;}
+
+        .btn-theme{font-size:18px;background:${isDark?'rgba(255,255,255,0.06)':'rgba(0,0,0,0.06)'};border:1px solid var(--border);padding:6px 10px;border-radius:9px;cursor:pointer;transition:all 0.15s;line-height:1;}
+        .btn-logout{font-size:12px;font-weight:600;color:#f87171;background:rgba(248,113,113,0.08);border:1px solid rgba(248,113,113,0.18);padding:7px 14px;border-radius:9px;cursor:pointer;transition:all 0.15s;font-family:'Sarabun',sans-serif;white-space:nowrap;}
+
+        .tabs{background:var(--hdr-bg);border-bottom:1px solid var(--border);display:flex;backdrop-filter:blur(12px);}
+        .tab-btn{flex:1;padding:13px 6px;font-size:13px;font-weight:500;color:var(--text4);background:none;border:none;border-bottom:2px solid transparent;cursor:pointer;transition:all 0.2s;font-family:'Sarabun',sans-serif;}
+        .tab-btn.active{color:var(--accent);border-bottom-color:var(--accent);background:var(--tab-active-bg);}
+
+        .main{max-width:520px;margin:0 auto;padding:14px 14px 60px;display:flex;flex-direction:column;gap:12px;}
+
+        .card{background:var(--bg2);border:1px solid var(--border);border-radius:16px;overflow:hidden;width:100%;}
+        .card-header{padding:13px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:10px;}
+        .card-header h2{font-size:14px;font-weight:600;color:var(--text);margin:0;}
+        .card-header.accent{background:${isDark?'linear-gradient(135deg,#0c3a5c 0%,#0f4c75 100%)':'linear-gradient(135deg,#e0f2fe 0%,#bae6fd 100%)'};border-bottom-color:${isDark?'rgba(56,189,248,0.15)':'rgba(2,132,199,0.15)'};}
+        .card-body{padding:16px;}
+
+        .session-prompt{display:flex;flex-direction:column;gap:14px;padding:20px 16px;}
+        .session-current{display:flex;align-items:center;gap:8px;background:${isDark?'rgba(56,189,248,0.08)':'rgba(2,132,199,0.06)'};border:1px solid ${isDark?'rgba(56,189,248,0.2)':'rgba(2,132,199,0.2)'};border-radius:10px;padding:10px 14px;}
+        .session-current span{font-size:13px;color:var(--accent);font-weight:600;}
+
+        .camera-wrap{position:relative;background:#000;aspect-ratio:4/3;overflow:hidden;}
+        .camera-wrap video{width:100%;height:100%;object-fit:cover;display:block;}
+        .scan-line{position:absolute;left:10%;right:10%;top:50%;height:2px;background:linear-gradient(90deg,transparent,var(--accent) 20%,var(--accent) 80%,transparent);animation:scanMove 2s ease-in-out infinite;}
+        @keyframes scanMove{0%,100%{top:35%;opacity:0.5;}50%{top:65%;opacity:1;}}
+        .corner{position:absolute;width:22px;height:22px;border-color:var(--accent);border-style:solid;opacity:0.9;}
+        .corner-tl{top:14px;left:14px;border-width:3px 0 0 3px;border-radius:3px 0 0 0;}
+        .corner-tr{top:14px;right:14px;border-width:3px 3px 0 0;border-radius:0 3px 0 0;}
+        .corner-bl{bottom:14px;left:14px;border-width:0 0 3px 3px;border-radius:0 0 0 3px;}
+        .corner-br{bottom:14px;right:14px;border-width:0 3px 3px 0;border-radius:0 0 3px 0;}
+        .camera-hint{text-align:center;font-size:12px;color:var(--cam-hint);padding:9px 12px;}
+
+        .cam-error{display:flex;flex-direction:column;align-items:center;gap:10px;padding:30px 20px;text-align:center;}
+        .cam-error .icon{font-size:44px;}
+        .cam-error p{color:var(--text3);font-size:13px;white-space:pre-line;margin:0;line-height:1.6;}
+
+        .manual-row{display:flex;gap:8px;padding:10px 12px 12px;border-top:1px solid var(--border);}
+        .input-rel{position:relative;flex:1;}
+        .input-icon-abs{position:absolute;left:11px;top:50%;transform:translateY(-50%);font-size:14px;pointer-events:none;opacity:0.6;}
+
+        .inp{width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:16px;font-family:'Sarabun',sans-serif;padding:10px 12px 10px 34px;outline:none;transition:border-color 0.15s,box-shadow 0.15s;}
+        .inp:focus{border-color:var(--accent);box-shadow:0 0 0 3px ${isDark?'rgba(56,189,248,0.08)':'rgba(2,132,199,0.08)'};}
+        .inp::placeholder{color:var(--text5);}
+        .inp-bare{background:var(--bg3);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:16px;font-family:'Sarabun',sans-serif;padding:10px 12px;outline:none;transition:border-color 0.15s;width:100%;}
+        .inp-bare:focus{border-color:var(--accent);}
+        .inp-bare::placeholder{color:var(--text5);}
+
+        .btn{border:none;border-radius:10px;font-family:'Sarabun',sans-serif;font-weight:600;cursor:pointer;transition:all 0.15s;display:inline-flex;align-items:center;justify-content:center;gap:6px;-webkit-tap-highlight-color:transparent;}
+        .btn:disabled{opacity:0.4;cursor:not-allowed;}
+        .btn:active:not(:disabled){transform:scale(0.97);}
+        .btn-sm{font-size:13px;padding:7px 14px;}
+        .btn-md{font-size:14px;padding:10px 16px;}
+        .btn-lg{font-size:16px;padding:13px 20px;width:100%;}
+        .btn-primary{background:var(--accent2);color:#fff;}
+        .btn-primary:hover:not(:disabled){background:var(--accent);}
+        .btn-success{background:#10b981;color:#fff;}
+        .btn-success:hover:not(:disabled){background:#34d399;}
+        .btn-ghost{background:${isDark?'rgba(255,255,255,0.04)':'rgba(0,0,0,0.04)'};color:var(--text3);border:1px solid var(--border);}
+        .btn-ghost:hover:not(:disabled){background:${isDark?'rgba(255,255,255,0.08)':'rgba(0,0,0,0.08)'};}
+        .btn-danger{background:rgba(239,68,68,0.1);color:#f87171;border:1px solid rgba(239,68,68,0.2);}
+        .btn-danger:hover:not(:disabled){background:rgba(239,68,68,0.18);}
+        .btn-share{background:#06C755;color:#fff;font-size:16px;padding:13px 20px;width:100%;}
+        .btn-share:hover:not(:disabled){background:#05b04c;}
+        .btn-share:disabled{opacity:0.4;cursor:not-allowed;}
+
+        .share-msg{border-radius:10px;padding:10px 14px;font-size:13px;font-weight:500;text-align:center;margin-top:4px;}
+        .share-msg.ok{background:rgba(6,199,85,0.1);border:1px solid rgba(6,199,85,0.25);color:#06C755;}
+        .share-msg.err{background:rgba(248,113,113,0.08);border:1px solid rgba(248,113,113,0.2);color:#f87171;}
+        .share-msg.info{background:${isDark?'rgba(56,189,248,0.08)':'rgba(2,132,199,0.06)'};border:1px solid ${isDark?'rgba(56,189,248,0.2)':'rgba(2,132,199,0.2)'};color:var(--accent);}
+        .share-tip{background:${isDark?'rgba(6,199,85,0.06)':'rgba(6,199,85,0.05)'};border:1px solid rgba(6,199,85,0.18);border-radius:10px;padding:10px 14px;font-size:12px;color:${isDark?'#4ade80':'#16a34a'};line-height:1.6;}
+
+        .qty-row{display:flex;align-items:center;gap:8px;}
+        .qty-btn{width:44px;height:44px;flex-shrink:0;background:var(--bg3);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:22px;font-weight:700;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background 0.15s;-webkit-tap-highlight-color:transparent;}
+        .qty-btn:active{transform:scale(0.93);}
+        .qty-input{flex:1;min-width:0;text-align:center;font-size:22px;font-weight:700;background:var(--bg3);border:1px solid var(--border);border-radius:10px;color:var(--accent);padding:8px;outline:none;font-family:'IBM Plex Mono',monospace;}
+        .qty-input:focus{border-color:var(--accent);}
+
+        .unit-group{display:flex;gap:8px;flex-wrap:wrap;}
+        .unit-btn{flex:1;min-width:60px;padding:9px 6px;font-size:14px;font-weight:600;font-family:'Sarabun',sans-serif;border-radius:10px;border:1px solid var(--border);background:var(--bg3);color:var(--text4);cursor:pointer;transition:all 0.15s;text-align:center;-webkit-tap-highlight-color:transparent;}
+        .unit-btn.active{background:var(--accent2);border-color:var(--accent2);color:#fff;}
+
+        .product-title{font-size:15px;font-weight:700;color:var(--accent);margin:0 0 12px;line-height:1.4;}
+        .meta-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:14px;}
+        .meta-box{background:var(--bg3);border:1px solid var(--border);border-radius:10px;padding:9px 12px;}
+        .meta-label{font-size:10px;color:var(--meta-label);font-family:'IBM Plex Mono',monospace;letter-spacing:0.06em;text-transform:uppercase;margin-bottom:3px;}
+        .meta-value{font-size:13px;font-weight:600;color:var(--text2);}
+
+        .badge{font-size:11px;font-weight:600;padding:3px 10px;border-radius:20px;border:1px solid;font-family:'IBM Plex Mono',monospace;}
+
+        .not-found{display:flex;flex-direction:column;align-items:center;gap:10px;padding:30px 20px;text-align:center;}
+        .barcode-mono{font-family:'IBM Plex Mono',monospace;font-size:12px;background:var(--bg3);border:1px solid var(--border);padding:4px 12px;border-radius:6px;color:var(--text4);}
+
+        .success-bar{background:rgba(16,185,129,0.08);border:1px solid rgba(16,185,129,0.22);border-radius:12px;padding:13px 18px;text-align:center;color:#34d399;font-weight:600;font-size:15px;}
+
+        .entry-item{display:flex;align-items:center;justify-content:space-between;padding:11px 16px;border-bottom:1px solid var(--border2);gap:10px;}
+        .entry-item:last-child{border-bottom:none;}
+        .entry-name{font-size:14px;font-weight:500;color:var(--text);}
+        .entry-meta{font-size:12px;color:var(--text4);margin-top:2px;}
+
+        .log-item{display:flex;align-items:flex-start;justify-content:space-between;padding:11px 16px;border-bottom:1px solid var(--border2);gap:10px;}
+        .log-item:last-child{border-bottom:none;}
+        .log-name{font-size:13px;font-weight:500;color:var(--text);}
+        .log-meta{font-size:11px;color:var(--text5);font-family:'IBM Plex Mono',monospace;margin-top:2px;}
+        .log-qty{font-size:13px;font-weight:600;color:var(--text3);margin-top:3px;}
+        .log-date{font-size:11px;color:var(--log-date);white-space:nowrap;font-family:'IBM Plex Mono',monospace;}
+
+        .filter-label{font-size:11px;color:var(--text4);margin-bottom:5px;font-family:'IBM Plex Mono',monospace;letter-spacing:0.04em;}
+        .select-inp{width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:16px;padding:9px 12px;outline:none;font-family:'Sarabun',sans-serif;transition:border-color 0.15s;cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24'%3E%3Cpath fill='%2394a3b8' d='M7 10l5 5 5-5z'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 10px center;padding-right:30px;}
+
+        .edit-form{padding:14px 16px;display:flex;flex-direction:column;gap:10px;background:var(--edit-bg);border-bottom:1px solid var(--border);}
+        .edit-title{font-size:13px;font-weight:600;color:var(--accent);margin:0;}
+
+        .scroll-area{max-height:55vh;overflow-y:auto;}
+        .scroll-area::-webkit-scrollbar{width:3px;}
+        .scroll-area::-webkit-scrollbar-thumb{background:var(--border);border-radius:3px;}
+
+        .section-label{font-size:11px;font-weight:600;color:var(--text4);letter-spacing:0.08em;text-transform:uppercase;font-family:'IBM Plex Mono',monospace;padding:2px 0 6px;}
+
+        .group-header{padding:8px 16px;font-size:11px;font-weight:700;color:var(--accent);letter-spacing:0.06em;text-transform:uppercase;font-family:'IBM Plex Mono',monospace;background:${isDark?'rgba(56,189,248,0.05)':'rgba(2,132,199,0.04)'};border-bottom:1px solid var(--border2);border-top:1px solid var(--border2);}
+        .group-header:first-child{border-top:none;}
+        .case-group-header{padding:7px 16px;font-size:11px;font-weight:700;color:#f59e0b;letter-spacing:0.06em;font-family:'IBM Plex Mono',monospace;background:${isDark?'rgba(245,158,11,0.05)':'rgba(245,158,11,0.04)'};border-bottom:1px solid var(--border2);border-top:1px solid var(--border2);display:flex;align-items:center;gap:8px;}
+
+        .pallet-thumb{width:48px;height:48px;border-radius:8px;object-fit:cover;border:1px solid var(--border);flex-shrink:0;cursor:pointer;}
+
+        /* Case done button — highlighted */
+        .btn-case-done{
+          background:linear-gradient(135deg,#f59e0b,#d97706);
+          color:#fff;font-size:15px;font-weight:700;
+          padding:14px 20px;width:100%;border-radius:12px;border:none;
+          font-family:'Sarabun',sans-serif;cursor:pointer;
+          box-shadow:0 4px 14px rgba(245,158,11,0.3);
+          transition:all 0.2s;
         }
+        .btn-case-done:active{transform:scale(0.97);}
+        .btn-case-done:disabled{opacity:0.4;cursor:not-allowed;}
 
-        .hdr {
-          background: var(--hdr-bg); border-bottom: 1px solid var(--border);
-          padding: 11px 18px; display: flex; align-items: center;
-          justify-content: space-between; position: sticky; top: 0; z-index: 100;
-          backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
-        }
-        .hdr-left { display: flex; align-items: center; gap: 12px; }
-        .hdr-right { display: flex; align-items: center; gap: 8px; }
-        .hdr-user-info { display: flex; flex-direction: column; gap: 1px; }
-        .hdr-name { font-size: 13px; font-weight: 600; color: var(--text2); line-height: 1.2; }
-        .hdr-id { font-size: 11px; color: var(--accent); font-family: 'IBM Plex Mono', monospace; letter-spacing: 0.04em; }
-
-        .btn-theme {
-          font-size: 18px;
-          background: ${isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)'};
-          border: 1px solid var(--border); padding: 6px 10px; border-radius: 9px;
-          cursor: pointer; transition: all 0.15s; line-height: 1;
-        }
-        .btn-theme:hover { background: ${isDark ? 'rgba(255,255,255,0.12)' : 'rgba(0,0,0,0.1)'}; }
-
-        .btn-logout {
-          font-size: 12px; font-weight: 600; color: #f87171;
-          background: rgba(248,113,113,0.08); border: 1px solid rgba(248,113,113,0.18);
-          padding: 7px 14px; border-radius: 9px; cursor: pointer;
-          transition: all 0.15s; font-family: 'Sarabun', sans-serif; white-space: nowrap;
-        }
-        .btn-logout:hover { background: rgba(248,113,113,0.16); }
-
-        .tabs { background: var(--hdr-bg); border-bottom: 1px solid var(--border); display: flex; backdrop-filter: blur(12px); }
-        .tab-btn {
-          flex: 1; padding: 13px 6px; font-size: 13px; font-weight: 500;
-          color: var(--text4); background: none; border: none;
-          border-bottom: 2px solid transparent; cursor: pointer;
-          transition: all 0.2s; font-family: 'Sarabun', sans-serif;
-        }
-        .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); background: var(--tab-active-bg); }
-
-        .main { max-width: 520px; margin: 0 auto; padding: 14px 14px 40px; display: flex; flex-direction: column; gap: 12px; }
-
-        .card { background: var(--bg2); border: 1px solid var(--border); border-radius: 16px; overflow: hidden; width: 100%; }
-        .card-header {
-          padding: 13px 16px; border-bottom: 1px solid var(--border);
-          display: flex; align-items: center; justify-content: space-between; gap: 10px;
-        }
-        .card-header h2 { font-size: 14px; font-weight: 600; color: var(--text); margin: 0; }
-        .card-header.accent {
-          background: ${isDark ? 'linear-gradient(135deg, #0c3a5c 0%, #0f4c75 100%)' : 'linear-gradient(135deg, #e0f2fe 0%, #bae6fd 100%)'};
-          border-bottom-color: ${isDark ? 'rgba(56,189,248,0.15)' : 'rgba(2,132,199,0.15)'};
-        }
-        .card-body { padding: 16px; }
-
-        .session-prompt { display: flex; flex-direction: column; gap: 14px; padding: 20px 16px; }
-        .session-prompt p { font-size: 14px; color: var(--text3); line-height: 1.6; }
-        .session-current { display: flex; align-items: center; gap: 8px; background: ${isDark ? 'rgba(56,189,248,0.08)' : 'rgba(2,132,199,0.06)'}; border: 1px solid ${isDark ? 'rgba(56,189,248,0.2)' : 'rgba(2,132,199,0.2)'}; border-radius: 10px; padding: 10px 14px; }
-        .session-current span { font-size: 13px; color: var(--accent); font-weight: 600; }
-
-        .camera-wrap { position: relative; background: #000; aspect-ratio: 4/3; overflow: hidden; }
-        .camera-wrap video { width: 100%; height: 100%; object-fit: cover; display: block; }
-        .scan-line { position: absolute; left: 10%; right: 10%; top: 50%; height: 2px; background: linear-gradient(90deg, transparent, var(--accent) 20%, var(--accent) 80%, transparent); animation: scanMove 2s ease-in-out infinite; }
-        @keyframes scanMove { 0%, 100% { top: 35%; opacity: 0.5; } 50% { top: 65%; opacity: 1; } }
-        .corner { position: absolute; width: 22px; height: 22px; border-color: var(--accent); border-style: solid; opacity: 0.9; }
-        .corner-tl { top: 14px; left: 14px; border-width: 3px 0 0 3px; border-radius: 3px 0 0 0; }
-        .corner-tr { top: 14px; right: 14px; border-width: 3px 3px 0 0; border-radius: 0 3px 0 0; }
-        .corner-bl { bottom: 14px; left: 14px; border-width: 0 0 3px 3px; border-radius: 0 0 0 3px; }
-        .corner-br { bottom: 14px; right: 14px; border-width: 0 3px 3px 0; border-radius: 0 0 3px 0; }
-        .camera-hint { text-align: center; font-size: 12px; color: var(--cam-hint); padding: 9px 12px; }
-
-        .cam-error { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 30px 20px; text-align: center; }
-        .cam-error .icon { font-size: 44px; }
-        .cam-error p { color: var(--text3); font-size: 13px; white-space: pre-line; margin: 0; line-height: 1.6; }
-
-        .manual-row { display: flex; gap: 8px; padding: 10px 12px 12px; border-top: 1px solid var(--border); }
-        .input-rel { position: relative; flex: 1; }
-        .input-icon-abs { position: absolute; left: 11px; top: 50%; transform: translateY(-50%); font-size: 14px; pointer-events: none; opacity: 0.6; }
-
-        .inp {
-          width: 100%; background: var(--bg3); border: 1px solid var(--border);
-          border-radius: 10px; color: var(--text); font-size: 16px;
-          font-family: 'Sarabun', sans-serif; padding: 10px 12px 10px 34px;
-          outline: none; transition: border-color 0.15s, box-shadow 0.15s;
-        }
-        .inp:focus { border-color: var(--accent); box-shadow: 0 0 0 3px ${isDark ? 'rgba(56,189,248,0.08)' : 'rgba(2,132,199,0.08)'}; }
-        .inp::placeholder { color: var(--text5); }
-        .inp-bare { background: var(--bg3); border: 1px solid var(--border); border-radius: 10px; color: var(--text); font-size: 16px; font-family: 'Sarabun', sans-serif; padding: 10px 12px; outline: none; transition: border-color 0.15s; width: 100%; }
-        .inp-bare:focus { border-color: var(--accent); }
-        .inp-bare::placeholder { color: var(--text5); }
-
-        .btn { border: none; border-radius: 10px; font-family: 'Sarabun', sans-serif; font-weight: 600; cursor: pointer; transition: all 0.15s; display: inline-flex; align-items: center; justify-content: center; gap: 6px; -webkit-tap-highlight-color: transparent; }
-        .btn:disabled { opacity: 0.4; cursor: not-allowed; }
-        .btn:active:not(:disabled) { transform: scale(0.97); }
-        .btn-sm  { font-size: 13px; padding: 7px 14px; }
-        .btn-md  { font-size: 14px; padding: 10px 16px; }
-        .btn-lg  { font-size: 16px; padding: 13px 20px; width: 100%; }
-        .btn-primary { background: var(--accent2); color: #fff; }
-        .btn-primary:hover:not(:disabled) { background: var(--accent); }
-        .btn-success { background: #10b981; color: #fff; }
-        .btn-success:hover:not(:disabled) { background: #34d399; }
-        .btn-ghost { background: ${isDark ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.04)'}; color: var(--text3); border: 1px solid var(--border); }
-        .btn-ghost:hover:not(:disabled) { background: ${isDark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.08)'}; }
-        .btn-danger { background: rgba(239,68,68,0.1); color: #f87171; border: 1px solid rgba(239,68,68,0.2); }
-        .btn-danger:hover:not(:disabled) { background: rgba(239,68,68,0.18); }
-        .btn-share { background: #06C755; color: #fff; font-size: 16px; padding: 13px 20px; width: 100%; }
-        .btn-share:hover:not(:disabled) { background: #05b04c; }
-        .btn-share:disabled { opacity: 0.4; cursor: not-allowed; }
-
-        .share-msg { border-radius: 10px; padding: 10px 14px; font-size: 13px; font-weight: 500; text-align: center; margin-top: 4px; }
-        .share-msg.ok   { background: rgba(6,199,85,0.1);   border: 1px solid rgba(6,199,85,0.25);   color: #06C755; }
-        .share-msg.err  { background: rgba(248,113,113,0.08); border: 1px solid rgba(248,113,113,0.2); color: #f87171; }
-        .share-msg.info { background: ${isDark ? 'rgba(56,189,248,0.08)' : 'rgba(2,132,199,0.06)'}; border: 1px solid ${isDark ? 'rgba(56,189,248,0.2)' : 'rgba(2,132,199,0.2)'}; color: var(--accent); }
-
-        .share-tip { background: ${isDark ? 'rgba(6,199,85,0.06)' : 'rgba(6,199,85,0.05)'}; border: 1px solid rgba(6,199,85,0.18); border-radius: 10px; padding: 10px 14px; font-size: 12px; color: ${isDark ? '#4ade80' : '#16a34a'}; line-height: 1.6; }
-
-        .qty-row { display: flex; align-items: center; gap: 8px; }
-        .qty-btn { width: 44px; height: 44px; flex-shrink: 0; background: var(--bg3); border: 1px solid var(--border); border-radius: 10px; color: var(--text); font-size: 22px; font-weight: 700; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: background 0.15s; -webkit-tap-highlight-color: transparent; }
-        .qty-btn:hover { background: var(--bg); }
-        .qty-btn:active { transform: scale(0.93); }
-        .qty-input { flex: 1; min-width: 0; text-align: center; font-size: 22px; font-weight: 700; background: var(--bg3); border: 1px solid var(--border); border-radius: 10px; color: var(--accent); padding: 8px; outline: none; font-family: 'IBM Plex Mono', monospace; }
-        .qty-input:focus { border-color: var(--accent); }
-
-        .unit-group { display: flex; gap: 8px; flex-wrap: wrap; }
-        .unit-btn { flex: 1; min-width: 60px; padding: 9px 6px; font-size: 14px; font-weight: 600; font-family: 'Sarabun', sans-serif; border-radius: 10px; border: 1px solid var(--border); background: var(--bg3); color: var(--text4); cursor: pointer; transition: all 0.15s; text-align: center; -webkit-tap-highlight-color: transparent; }
-        .unit-btn.active { background: var(--accent2); border-color: var(--accent2); color: #fff; }
-        .unit-btn:hover:not(.active) { border-color: var(--accent); color: var(--accent); }
-
-        .product-title { font-size: 15px; font-weight: 700; color: var(--accent); margin: 0 0 12px; line-height: 1.4; }
-        .meta-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 14px; }
-        .meta-box { background: var(--bg3); border: 1px solid var(--border); border-radius: 10px; padding: 9px 12px; }
-        .meta-label { font-size: 10px; color: var(--meta-label); font-family: 'IBM Plex Mono', monospace; letter-spacing: 0.06em; text-transform: uppercase; margin-bottom: 3px; }
-        .meta-value { font-size: 13px; font-weight: 600; color: var(--text2); }
-
-        .badge { font-size: 11px; font-weight: 600; padding: 3px 10px; border-radius: 20px; border: 1px solid; font-family: 'IBM Plex Mono', monospace; }
-
-        .not-found { display: flex; flex-direction: column; align-items: center; gap: 10px; padding: 30px 20px; text-align: center; }
-        .not-found .icon { font-size: 42px; }
-        .barcode-mono { font-family: 'IBM Plex Mono', monospace; font-size: 12px; background: var(--bg3); border: 1px solid var(--border); padding: 4px 12px; border-radius: 6px; color: var(--text4); }
-
-        .success-bar { background: rgba(16,185,129,0.08); border: 1px solid rgba(16,185,129,0.22); border-radius: 12px; padding: 13px 18px; text-align: center; color: #34d399; font-weight: 600; font-size: 15px; }
-
-        .entry-item { display: flex; align-items: center; justify-content: space-between; padding: 11px 16px; border-bottom: 1px solid var(--border2); gap: 10px; }
-        .entry-item:last-child { border-bottom: none; }
-        .entry-name { font-size: 14px; font-weight: 500; color: var(--text); }
-        .entry-meta { font-size: 12px; color: var(--text4); margin-top: 2px; }
-
-        .log-item { display: flex; align-items: flex-start; justify-content: space-between; padding: 11px 16px; border-bottom: 1px solid var(--border2); gap: 10px; }
-        .log-item:last-child { border-bottom: none; }
-        .log-name { font-size: 13px; font-weight: 500; color: var(--text); }
-        .log-meta { font-size: 11px; color: var(--text5); font-family: 'IBM Plex Mono', monospace; margin-top: 2px; }
-        .log-qty { font-size: 13px; font-weight: 600; color: var(--text3); margin-top: 3px; }
-        .log-date { font-size: 11px; color: var(--log-date); white-space: nowrap; font-family: 'IBM Plex Mono', monospace; }
-
-        .filter-label { font-size: 11px; color: var(--text4); margin-bottom: 5px; font-family: 'IBM Plex Mono', monospace; letter-spacing: 0.04em; }
-        .select-inp { width: 100%; background: var(--bg3); border: 1px solid var(--border); border-radius: 10px; color: var(--text); font-size: 16px; padding: 9px 12px; outline: none; font-family: 'Sarabun', sans-serif; transition: border-color 0.15s; cursor: pointer; appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24'%3E%3Cpath fill='%2394a3b8' d='M7 10l5 5 5-5z'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 10px center; padding-right: 30px; }
-        .select-inp:focus { border-color: var(--accent); }
-
-        .edit-form { padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; background: var(--edit-bg); border-bottom: 1px solid var(--border); }
-        .edit-title { font-size: 13px; font-weight: 600; color: var(--accent); margin: 0; }
-
-        .scroll-area { max-height: 55vh; overflow-y: auto; }
-        .scroll-area::-webkit-scrollbar { width: 3px; }
-        .scroll-area::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
-
-        .section-label { font-size: 11px; font-weight: 600; color: var(--text4); letter-spacing: 0.08em; text-transform: uppercase; font-family: 'IBM Plex Mono', monospace; padding: 2px 0 6px; }
-
-        .group-header { padding: 8px 16px; font-size: 11px; font-weight: 700; color: var(--accent); letter-spacing: 0.06em; text-transform: uppercase; font-family: 'IBM Plex Mono', monospace; background: ${isDark ? 'rgba(56,189,248,0.05)' : 'rgba(2,132,199,0.04)'}; border-bottom: 1px solid var(--border2); border-top: 1px solid var(--border2); }
-        .group-header:first-child { border-top: none; }
-
-        .case-group-header { padding: 7px 16px; font-size: 11px; font-weight: 700; color: #f59e0b; letter-spacing: 0.06em; font-family: 'IBM Plex Mono', monospace; background: ${isDark ? 'rgba(245,158,11,0.05)' : 'rgba(245,158,11,0.04)'}; border-bottom: 1px solid var(--border2); border-top: 1px solid var(--border2); display: flex; align-items: center; gap: 8px; }
-
-        .action-divider { display: flex; align-items: center; gap: 10px; font-size: 11px; color: var(--text5); font-family: 'IBM Plex Mono', monospace; }
-        .action-divider::before, .action-divider::after { content: ''; flex: 1; border-top: 1px solid var(--border); }
-
-        .pallet-thumb { width: 48px; height: 48px; border-radius: 8px; object-fit: cover; border: 1px solid var(--border); flex-shrink: 0; cursor: pointer; }
-
-        @media (max-width: 400px) {
-          .main { padding: 10px 10px 36px; gap: 10px; }
-          .hdr { padding: 10px 12px; }
-          .tab-btn { font-size: 12px; padding: 11px 4px; }
+        @media(max-width:400px){
+          .main{padding:10px 10px 36px;gap:10px;}
+          .hdr{padding:10px 12px;}
+          .tab-btn{font-size:12px;padding:11px 4px;}
         }
       `}</style>
 
@@ -987,16 +955,18 @@ export default function ScanPage() {
         {/* ── Header ── */}
         <div className="hdr">
           <div className="hdr-left">
-            <Image src="https://i.postimg.cc/RVy6cmjv/RSM-group-logo-outline-1.png" alt="RSM" width={68} height={26} unoptimized style={{ objectFit: 'contain', filter: isDark ? 'brightness(1.2)' : 'none', flexShrink: 0 }} />
+            <Image src="https://i.postimg.cc/RVy6cmjv/RSM-group-logo-outline-1.png"
+              alt="RSM" width={68} height={26} unoptimized
+              style={{ objectFit: 'contain', filter: isDark ? 'brightness(1.2)' : 'none', flexShrink: 0 }} />
             {employeeName && (
-              <div className="hdr-user-info">
-                <span className="hdr-name">{employeeName}</span>
-                <span className="hdr-id">#{employeeId}</span>
+              <div>
+                <div className="hdr-name">{employeeName}</div>
+                <div className="hdr-id">#{employeeId}</div>
               </div>
             )}
           </div>
           <div className="hdr-right">
-            <button className="btn-theme" onClick={toggleTheme} title="เปลี่ยนธีม">{isDark ? '☀️' : '🌙'}</button>
+            <button className="btn-theme" onClick={toggleTheme}>{isDark ? '☀️' : '🌙'}</button>
             <button className="btn-logout" onClick={handleLogout}>ออกจากระบบ</button>
           </div>
         </div>
@@ -1004,7 +974,8 @@ export default function ScanPage() {
         {/* ── Tabs ── */}
         <div className="tabs">
           {[{ key: 'scan', label: '📷 สแกน' }, { key: 'history', label: '📋 ประวัติฉัน' }, { key: 'manage', label: '⚙️ จัดการ' }].map(t => (
-            <button key={t.key} className={`tab-btn ${tab === t.key ? 'active' : ''}`} onClick={() => setTab(t.key as TabType)}>{t.label}</button>
+            <button key={t.key} className={`tab-btn ${tab === t.key ? 'active' : ''}`}
+              onClick={() => setTab(t.key as TabType)}>{t.label}</button>
           ))}
         </div>
 
@@ -1013,16 +984,19 @@ export default function ScanPage() {
           {/* ══════════ TAB: SCAN ══════════ */}
           {tab === 'scan' && (
             <>
-              {successMsg && !entries.length && <div className="success-bar">{successMsg}</div>}
+              {successMsg && <div className="success-bar">{successMsg}</div>}
 
-              {/* ── Step 1: ตั้งหัวข้อ + ถ่ายรูปพาเลท + จำนวนลัง ── */}
+              {/* ── STEP 1: หัวข้อ + ถ่ายรูปพาเลท ── */}
               {!sessionConfirmed ? (
                 <div className="card">
                   <div className="card-header accent">
                     <h2>📝 ตั้งหัวข้อการสแกน</h2>
                   </div>
                   <div className="session-prompt">
-                    <p>กรุณากรอกหัวข้อหรือชื่อรอบการตรวจนับ<br/>เช่น <strong>เช็คสต็อก</strong>, <strong>รับสินค้าเข้า</strong>, <strong>ตรวจนับพฤษภาคม</strong></p>
+                    <p style={{ fontSize: 14, color: 'var(--text3)', lineHeight: 1.6 }}>
+                      กรอกหัวข้อหรือชื่อรอบการตรวจนับ<br/>
+                      เช่น <strong>เช็คสต็อก</strong>, <strong>รับสินค้าเข้า</strong>
+                    </p>
 
                     <input
                       type="text"
@@ -1034,105 +1008,83 @@ export default function ScanPage() {
                         if (e.key === 'Enter' && sessionInput.trim()) {
                           setSessionLabel(sessionInput.trim())
                           setSessionConfirmed(true)
+                          setScanning(true)
                         }
                       }}
                     />
 
-                    {/* ── Pallet photo ── */}
+                    {/* ── ถ่ายรูปพาเลท ── */}
                     <PalletPhotoSection />
-
-                    {/* ── จำนวนลังในพาเลท ── */}
-                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                      <div style={{ fontSize: 11, color: 'var(--text4)', fontFamily: "'IBM Plex Mono', monospace", letterSpacing: '0.06em', textTransform: 'uppercase' }}>
-                        📦 จำนวนลังในพาเลท
-                      </div>
-                      <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-                        <div className="qty-row" style={{ flex: 1 }}>
-                          <button className="qty-btn" onClick={() => setTotalCasesInput(v => String(Math.max(1, parseInt(v || '1') - 1)))}>−</button>
-                          <input
-                            type="number"
-                            inputMode="numeric"
-                            className="qty-input"
-                            value={totalCasesInput}
-                            onChange={e => setTotalCasesInput(e.target.value)}
-                            placeholder="0"
-                            min={1}
-                          />
-                          <button className="qty-btn" onClick={() => setTotalCasesInput(v => String((parseInt(v || '0') || 0) + 1))}>+</button>
-                        </div>
-                        <span style={{ fontSize: 14, color: 'var(--text4)', fontWeight: 600, whiteSpace: 'nowrap' }}>ลัง</span>
-                      </div>
-                      {totalCasesInput && parseInt(totalCasesInput) > 0 && (
-                        <div style={{ fontSize: 12, color: 'var(--accent)', fontFamily: "'IBM Plex Mono', monospace" }}>
-                          จะนับสินค้าแยกทีละลัง: 1/{totalCasesInput} → {totalCasesInput}/{totalCasesInput}
-                        </div>
-                      )}
-                    </div>
 
                     <button
                       className="btn btn-primary btn-lg"
-                      disabled={!sessionInput.trim() || !totalCasesInput || parseInt(totalCasesInput) < 1}
+                      disabled={!sessionInput.trim()}
                       onClick={() => {
-                        const n = parseInt(totalCasesInput) || 1
                         setSessionLabel(sessionInput.trim())
-                        setTotalCases(n)
                         setCurrentCaseNumber(1)
-                        setCaseConfirmed(true)
                         setSessionConfirmed(true)
                         setScanning(true)
                       }}
                     >
-                      ✅ ยืนยัน แล้วเริ่มสแกนลังที่ 1/{totalCasesInput || '?'}
+                      ✅ ยืนยัน — เริ่มสแกนลังที่ 1
                     </button>
                   </div>
                 </div>
               ) : (
                 <>
-                  {/* Session badge + case progress */}
+                  {/* Session badge + change button */}
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
                     <div className="session-current" style={{ flex: 1 }}>
                       <span>📋 {sessionLabel}</span>
                       {palletImageUrl && (
-                        <img src={palletImageUrl} alt="pallet" style={{ width: 32, height: 32, borderRadius: 6, objectFit: 'cover', border: '1px solid rgba(52,211,153,0.4)', marginLeft: 'auto' }} />
+                        <img src={palletImageUrl} alt="pallet"
+                          style={{ width: 32, height: 32, borderRadius: 6, objectFit: 'cover', border: '1px solid rgba(52,211,153,0.4)', marginLeft: 'auto', cursor: 'pointer' }}
+                          onClick={() => window.open(palletImageUrl, '_blank')} />
                       )}
                     </div>
-                    <button
-                      className="btn btn-ghost btn-sm"
-                      onClick={() => {
-                        stopCamera(); setScanning(false)
-                        setSessionConfirmed(false); setSessionInput('')
-                        setCurrentEntry(null); setNotFound(false); setManualBarcode('')
-                        setEntries([])
-                        setPalletImageUrl(null); setPalletImageDataUrl(null); setPalletPhotoMode('idle')
-                        setTotalCasesInput(''); setTotalCases(0); setCurrentCaseNumber(1); setCaseConfirmed(false)
-                      }}
-                    >เปลี่ยนหัวข้อ</button>
+                    <button className="btn btn-ghost btn-sm" onClick={() => {
+                      stopCamera(); setScanning(false)
+                      setSessionConfirmed(false); setSessionInput('')
+                      setCurrentEntry(null); setNotFound(false); setManualBarcode('')
+                      setEntries([])
+                      setPalletImageUrl(null); setPalletImageDataUrl(null); setPalletPhotoMode('idle')
+                      setCurrentCaseNumber(1)
+                    }}>เปลี่ยนหัวข้อ</button>
                   </div>
 
-                  {/* Case progress */}
-                  {totalCases > 0 && <CaseProgressBar />}
+                  {/* Current case pill */}
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                    <CasePill />
+                    {entries.length === 0 && currentCaseNumber > 1 && (
+                      <span style={{ fontSize: 12, color: 'var(--text4)', fontFamily: "'IBM Plex Mono',monospace" }}>
+                        ลังก่อนหน้าบันทึกแล้ว ✓
+                      </span>
+                    )}
+                  </div>
 
                   {/* Camera Card */}
                   {scanning && (
                     <div className="card">
                       <div className="card-header accent">
                         <h2>📷 สแกนบาร์โค้ด</h2>
-                        {totalCases > 0 && (
-                          <span className="badge" style={{ color: '#f59e0b', borderColor: '#78350f', background: '#451a0355' }}>
-                            ลัง {currentCaseNumber}/{totalCases}
-                          </span>
-                        )}
+                        <span className="badge" style={{ color: '#f59e0b', borderColor: 'rgba(245,158,11,0.3)', background: 'rgba(245,158,11,0.1)' }}>
+                          ลัง {currentCaseNumber}
+                        </span>
                       </div>
                       {cameraError ? (
                         <div className="cam-error">
                           <span className="icon">📵</span>
                           <p>{cameraError}</p>
-                          <button className="btn btn-primary btn-md" onClick={() => { setCameraError(''); setScanning(false); setTimeout(() => setScanning(true), 400) }}>ลองใหม่</button>
+                          <button className="btn btn-primary btn-md"
+                            onClick={() => { setCameraError(''); setScanning(false); setTimeout(() => setScanning(true), 400) }}>
+                            ลองใหม่
+                          </button>
                         </div>
                       ) : (
                         <>
                           <div className="camera-wrap">
-                            <video ref={videoRef} playsInline muted autoPlay style={{ display: 'block', width: '100%', height: '100%', objectFit: 'cover' }} />
+                            <video ref={videoRef} playsInline muted autoPlay
+                              style={{ display: 'block', width: '100%', height: '100%', objectFit: 'cover' }} />
                             <div className="scan-line" />
                             <div className="corner corner-tl" /><div className="corner corner-tr" />
                             <div className="corner corner-bl" /><div className="corner corner-br" />
@@ -1143,9 +1095,17 @@ export default function ScanPage() {
                       <div className="manual-row">
                         <div className="input-rel">
                           <span className="input-icon-abs">🔍</span>
-                          <input type="text" inputMode="numeric" className="inp" value={manualBarcode} onChange={e => setManualBarcode(e.target.value)} onKeyDown={e => e.key === 'Enter' && handleManualSearch()} placeholder="พิมพ์บาร์โค้ด / รหัสสินค้า" />
+                          <input type="text" inputMode="numeric" className="inp"
+                            value={manualBarcode}
+                            onChange={e => setManualBarcode(e.target.value)}
+                            onKeyDown={e => e.key === 'Enter' && handleManualSearch()}
+                            placeholder="พิมพ์บาร์โค้ด / รหัสสินค้า" />
                         </div>
-                        <button className="btn btn-primary btn-md" onClick={handleManualSearch} disabled={searching || !manualBarcode.trim()}>{searching ? '...' : 'ค้นหา'}</button>
+                        <button className="btn btn-primary btn-md"
+                          onClick={handleManualSearch}
+                          disabled={searching || !manualBarcode.trim()}>
+                          {searching ? '...' : 'ค้นหา'}
+                        </button>
                       </div>
                     </div>
                   )}
@@ -1154,10 +1114,13 @@ export default function ScanPage() {
                   {notFound && (
                     <div className="card">
                       <div className="not-found">
-                        <span className="icon">❌</span>
+                        <span style={{ fontSize: 42 }}>❌</span>
                         <p style={{ color: 'var(--text)', fontWeight: 600, fontSize: 15, margin: 0 }}>ไม่พบสินค้าในระบบ</p>
                         <span className="barcode-mono">{lastSearched}</span>
-                        <button className="btn btn-primary btn-md" style={{ marginTop: 6 }} onClick={() => { setNotFound(false); setManualBarcode(''); setScanning(true) }}>📷 สแกนใหม่</button>
+                        <button className="btn btn-primary btn-md" style={{ marginTop: 6 }}
+                          onClick={() => { setNotFound(false); setManualBarcode(''); setScanning(true) }}>
+                          📷 สแกนใหม่
+                        </button>
                       </div>
                     </div>
                   )}
@@ -1167,15 +1130,13 @@ export default function ScanPage() {
                     <div className="card">
                       <div className="card-header">
                         <h2>กรอกข้อมูลสินค้า</h2>
-                        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-                          {totalCases > 0 && (
-                            <span className="badge" style={{ color: '#f59e0b', borderColor: '#78350f44', background: '#f59e0b14' }}>
-                              ลัง {currentCaseNumber}/{totalCases}
-                            </span>
-                          )}
+                        <div style={{ display: 'flex', gap: 6 }}>
+                          <span className="badge" style={{ color: '#f59e0b', borderColor: 'rgba(245,158,11,0.3)', background: 'rgba(245,158,11,0.1)' }}>
+                            ลัง {currentCaseNumber}
+                          </span>
                           {(() => {
                             const b = barcodeBadge(currentEntry.barcodeType)
-                            return <span className="badge" style={{ color: b.color, borderColor: b.color + '44', background: b.color + '14' }}>{b.label}</span>
+                            return <span className="badge" style={{ color: b.color, borderColor: b.color+'44', background: b.color+'14' }}>{b.label}</span>
                           })()}
                         </div>
                       </div>
@@ -1194,9 +1155,13 @@ export default function ScanPage() {
                         <div>
                           <div className="section-label">จำนวน</div>
                           <div className="qty-row">
-                            <button className="qty-btn" onClick={() => setCurrentEntry(e => e ? { ...e, quantity: Math.max(1, e.quantity - 1) } : e)}>−</button>
-                            <input type="number" className="qty-input" value={currentEntry.quantity} onChange={ev => setCurrentEntry(e => e ? { ...e, quantity: Math.max(1, parseInt(ev.target.value) || 1) } : e)} />
-                            <button className="qty-btn" onClick={() => setCurrentEntry(e => e ? { ...e, quantity: e.quantity + 1 } : e)}>+</button>
+                            <button className="qty-btn"
+                              onClick={() => setCurrentEntry(e => e ? { ...e, quantity: Math.max(1, e.quantity - 1) } : e)}>−</button>
+                            <input type="number" className="qty-input"
+                              value={currentEntry.quantity}
+                              onChange={ev => setCurrentEntry(e => e ? { ...e, quantity: Math.max(1, parseInt(ev.target.value) || 1) } : e)} />
+                            <button className="qty-btn"
+                              onClick={() => setCurrentEntry(e => e ? { ...e, quantity: e.quantity + 1 } : e)}>+</button>
                           </div>
                         </div>
 
@@ -1204,15 +1169,16 @@ export default function ScanPage() {
                           <div className="section-label">หน่วย</div>
                           <div className="unit-group">
                             {unitOptions.map(u => (
-                              <button key={u} className={`unit-btn ${currentEntry.unit === u ? 'active' : ''}`} onClick={() => setCurrentEntry(e => e ? { ...e, unit: u } : e)}>{u}</button>
+                              <button key={u} className={`unit-btn ${currentEntry.unit === u ? 'active' : ''}`}
+                                onClick={() => setCurrentEntry(e => e ? { ...e, unit: u } : e)}>{u}</button>
                             ))}
                           </div>
                         </div>
 
-                        {/* ── วันผลิต ── */}
+                        {/* วันผลิต — fixed keyboard dismiss */}
                         <div>
                           <div className="section-label">วันผลิต / MFG Date</div>
-                          <DateInput
+                          <DateInputField
                             value={currentEntry.mfgDate}
                             onChange={v => setCurrentEntry(e => e ? { ...e, mfgDate: v } : e)}
                             placeholder="วว/ดด/ปปปป เช่น 01/06/2568"
@@ -1220,10 +1186,10 @@ export default function ScanPage() {
                           />
                         </div>
 
-                        {/* ── วันหมดอายุ ── */}
+                        {/* วันหมดอายุ — fixed keyboard dismiss */}
                         <div>
                           <div className="section-label">วันหมดอายุ / EXP Date</div>
-                          <DateInput
+                          <DateInputField
                             value={currentEntry.expDate}
                             onChange={v => setCurrentEntry(e => e ? { ...e, expDate: v } : e)}
                             placeholder="วว/ดด/ปปปป เช่น 01/06/2570"
@@ -1231,25 +1197,31 @@ export default function ScanPage() {
                           />
                         </div>
 
-                        <input type="text" className="inp-bare" placeholder="หมายเหตุ (ถ้ามี)" value={currentEntry.note} onChange={ev => setCurrentEntry(e => e ? { ...e, note: ev.target.value } : e)} />
+                        <input type="text" className="inp-bare"
+                          placeholder="หมายเหตุ (ถ้ามี)"
+                          value={currentEntry.note}
+                          onChange={ev => setCurrentEntry(e => e ? { ...e, note: ev.target.value } : e)} />
 
-                        <button className="btn btn-success btn-lg" onClick={handleSaveNow} disabled={savingNow}>
-                          {savingNow ? 'กำลังบันทึก...' : `💾 บันทึกทันที${totalCases > 0 ? ` (ลัง ${currentCaseNumber}/${totalCases})` : ''}`}
+                        {/* Add to pending list for this case */}
+                        <button className="btn btn-success btn-lg" onClick={handleAddEntry}>
+                          ➕ เพิ่มในลังที่ {currentCaseNumber}
                         </button>
-                        <div style={{ display: 'flex', gap: 8 }}>
-                          <button className="btn btn-primary btn-md" style={{ flex: 1 }} onClick={handleAddEntry}>➕ เก็บในรายการ</button>
-                          <button className="btn btn-ghost btn-md" style={{ flex: 1 }} onClick={() => { setCurrentEntry(null); setManualBarcode(''); setScanning(true) }}>📷 สแกนใหม่</button>
-                        </div>
+                        <button className="btn btn-ghost btn-md"
+                          onClick={() => { setCurrentEntry(null); setManualBarcode(''); setScanning(true) }}>
+                          📷 สแกนใหม่
+                        </button>
                       </div>
                     </div>
                   )}
 
-                  {/* Pending Entries */}
+                  {/* Pending Entries for current case */}
                   {entries.length > 0 && (
                     <div className="card">
                       <div className="card-header">
-                        <h2>📦 รายการรอบันทึก{totalCases > 0 ? ` — ลัง ${currentCaseNumber}/${totalCases}` : ''}</h2>
-                        <span className="badge" style={{ color: '#93c5fd', borderColor: '#1e3a8a', background: '#1e3a8a55' }}>{entries.length} รายการ</span>
+                        <h2>📦 รายการในลังที่ {currentCaseNumber}</h2>
+                        <span className="badge" style={{ color: '#f59e0b', borderColor: 'rgba(245,158,11,0.3)', background: 'rgba(245,158,11,0.1)' }}>
+                          {entries.length} รายการ
+                        </span>
                       </div>
                       <div className="scroll-area">
                         {entries.map((e, idx) => (
@@ -1267,17 +1239,37 @@ export default function ScanPage() {
                           </div>
                         ))}
                       </div>
-                      {successMsg && <div className="success-bar" style={{ margin: '0 14px 12px' }}>{successMsg}</div>}
-                      <div style={{ padding: '0 14px 14px', display: 'flex', flexDirection: 'column', gap: 8 }}>
-                        <button className="btn btn-success btn-lg" onClick={handleSaveAll} disabled={saving}>
-                          {saving ? 'กำลังบันทึก...' : `💾 บันทึกทั้งหมด ${entries.length} รายการ`}
+
+                      {/* CTA: finish this case → save to DB + go to next */}
+                      <div style={{ padding: '12px 14px', display: 'flex', flexDirection: 'column', gap: 8 }}>
+                        <button
+                          className="btn-case-done"
+                          onClick={handleCaseDone}
+                          disabled={savingCase}>
+                          {savingCase
+                            ? '⏳ กำลังบันทึก...'
+                            : `✅ ลังที่ ${currentCaseNumber} เสร็จแล้ว — บันทึก & ไปลังที่ ${currentCaseNumber + 1}`}
                         </button>
-                        {totalCases > 0 && currentCaseNumber < totalCases && (
-                          <button className="btn btn-primary btn-lg" onClick={() => { handleSaveAll().then(() => handleCaseDone()) }}>
-                            ✅ บันทึก + ไปลังที่ {currentCaseNumber + 1}/{totalCases}
+                        {/* continue scanning without finishing case yet */}
+                        {!scanning && !currentEntry && (
+                          <button className="btn btn-ghost btn-md" onClick={() => setScanning(true)}>
+                            📷 สแกนสินค้าเพิ่มในลังนี้
                           </button>
                         )}
                       </div>
+                    </div>
+                  )}
+
+                  {/* If no entries yet, show shortcut to finish empty case / move to next */}
+                  {entries.length === 0 && !currentEntry && !notFound && !scanning && sessionConfirmed && (
+                    <div style={{ display: 'flex', gap: 8 }}>
+                      <button className="btn btn-ghost btn-md" style={{ flex: 1 }} onClick={() => setScanning(true)}>
+                        📷 สแกนต่อ
+                      </button>
+                      <button className="btn btn-ghost btn-md" style={{ flex: 1, color: '#f59e0b', borderColor: 'rgba(245,158,11,0.3)' }}
+                        onClick={handleCaseDone}>
+                        ข้ามไปลังที่ {currentCaseNumber + 1}
+                      </button>
                     </div>
                   )}
                 </>
@@ -1301,7 +1293,6 @@ export default function ScanPage() {
               ) : (
                 <div className="scroll-area">
                   {(() => {
-                    // Group by session_label → then by case_number
                     const sessionGroups: Record<string, ScanLog[]> = {}
                     logs.forEach(l => {
                       const key = l.session_label || '(ไม่มีหัวข้อ)'
@@ -1309,12 +1300,9 @@ export default function ScanPage() {
                       sessionGroups[key].push(l)
                     })
                     return Object.entries(sessionGroups).map(([label, items]) => {
-                      // sub-group by case_number
                       const caseGroups: Record<string, ScanLog[]> = {}
                       items.forEach(l => {
-                        const ckey = l.case_number != null && l.total_cases != null
-                          ? `ลังที่ ${l.case_number}/${l.total_cases}`
-                          : '—'
+                        const ckey = l.case_number != null ? `ลังที่ ${l.case_number}` : '—'
                         if (!caseGroups[ckey]) caseGroups[ckey] = []
                         caseGroups[ckey].push(l)
                       })
@@ -1323,14 +1311,14 @@ export default function ScanPage() {
                           <div className="group-header">
                             📋 {label} · {items.length} รายการ
                             {items[0]?.pallet_image_url && (
-                              <img src={items[0].pallet_image_url} alt="pallet" style={{ display: 'inline-block', verticalAlign: 'middle', marginLeft: 8, width: 28, height: 28, borderRadius: 6, objectFit: 'cover' }} onClick={() => window.open(items[0].pallet_image_url!, '_blank')} />
+                              <img src={items[0].pallet_image_url} alt="pallet"
+                                style={{ display: 'inline-block', verticalAlign: 'middle', marginLeft: 8, width: 28, height: 28, borderRadius: 6, objectFit: 'cover', cursor: 'pointer' }}
+                                onClick={() => window.open(items[0].pallet_image_url!, '_blank')} />
                             )}
                           </div>
                           {Object.entries(caseGroups).map(([caseKey, caseLogs]) => (
                             <div key={caseKey}>
-                              <div className="case-group-header">
-                                📦 {caseKey} · {caseLogs.length} รายการ
-                              </div>
+                              <div className="case-group-header">📦 {caseKey} · {caseLogs.length} รายการ</div>
                               {caseLogs.map(l => (
                                 <div key={l.id} className="log-item">
                                   <div style={{ flex: 1 }}>
@@ -1373,13 +1361,17 @@ export default function ScanPage() {
                   {(() => {
                     const count = getFilteredLogs().length
                     return count > 0 ? (
-                      <div style={{ fontSize: 12, color: 'var(--text4)', fontFamily: "'IBM Plex Mono', monospace", textAlign: 'center' }}>
+                      <div style={{ fontSize: 12, color: 'var(--text4)', fontFamily: "'IBM Plex Mono',monospace", textAlign: 'center' }}>
                         {count} รายการ{filterLabel ? ` · หัวข้อ "${filterLabel}"` : ''}
                       </div>
                     ) : null
                   })()}
                   <button className="btn btn-success btn-lg" onClick={handleDownload}>⬇️ Download CSV</button>
-                  <div className="action-divider">หรือ</div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 11, color: 'var(--text5)', fontFamily: "'IBM Plex Mono',monospace" }}>
+                    <div style={{ flex: 1, borderTop: '1px solid var(--border)' }} />
+                    หรือ
+                    <div style={{ flex: 1, borderTop: '1px solid var(--border)' }} />
+                  </div>
                   <button className="btn btn-share" onClick={handleShare} disabled={sharing || getFilteredLogs().length === 0}>
                     {sharing ? '⏳ กำลังเตรียมไฟล์...' : '💚 แชร์ไปยัง LINE / แอปอื่น'}
                   </button>
@@ -1388,8 +1380,8 @@ export default function ScanPage() {
                   )}
                   <div className="share-tip">
                     💡 <strong>วิธีแชร์ไป LINE:</strong> กดปุ่มแชร์ → เลือก LINE → เลือกแชทหรือกลุ่มที่ต้องการ<br/>
-                    ไฟล์ CSV จะถูกส่งเป็นไฟล์แนบ เปิดได้ด้วย Excel หรือ Google Sheets<br/>
-                    คอลัมน์ <strong>ลังที่ / จากลังทั้งหมด</strong> จะแสดงแยกชัดเจนแต่ละลัง
+                    ไฟล์ CSV เปิดได้ด้วย Excel หรือ Google Sheets<br/>
+                    คอลัมน์ <strong>ลังที่</strong> จะแสดงแยกชัดเจนแต่ละลัง
                   </div>
                 </div>
               </div>
@@ -1422,9 +1414,7 @@ export default function ScanPage() {
                       return Object.entries(sessionGroups).map(([label, items]) => {
                         const caseGroups: Record<string, ScanLog[]> = {}
                         items.forEach(l => {
-                          const ckey = l.case_number != null && l.total_cases != null
-                            ? `${l.case_number}/${l.total_cases}`
-                            : '—'
+                          const ckey = l.case_number != null ? `${l.case_number}` : '—'
                           if (!caseGroups[ckey]) caseGroups[ckey] = []
                           caseGroups[ckey].push(l)
                         })
@@ -1433,28 +1423,33 @@ export default function ScanPage() {
                             <div className="group-header">
                               📋 {label} · {items.length} รายการ
                               {items[0]?.pallet_image_url && (
-                                <img src={items[0].pallet_image_url} alt="pallet" style={{ display: 'inline-block', verticalAlign: 'middle', marginLeft: 8, width: 28, height: 28, borderRadius: 6, objectFit: 'cover', border: '1px solid rgba(52,211,153,0.3)', cursor: 'pointer' }} onClick={() => window.open(items[0].pallet_image_url!, '_blank')} />
+                                <img src={items[0].pallet_image_url} alt="pallet"
+                                  style={{ display: 'inline-block', verticalAlign: 'middle', marginLeft: 8, width: 28, height: 28, borderRadius: 6, objectFit: 'cover', border: '1px solid rgba(52,211,153,0.3)', cursor: 'pointer' }}
+                                  onClick={() => window.open(items[0].pallet_image_url!, '_blank')} />
                               )}
                             </div>
                             {Object.entries(caseGroups).map(([caseKey, caseLogs]) => (
                               <div key={caseKey}>
-                                <div className="case-group-header">
-                                  📦 ลังที่ {caseKey} · {caseLogs.length} รายการ
-                                </div>
+                                <div className="case-group-header">📦 ลังที่ {caseKey} · {caseLogs.length} รายการ</div>
                                 {caseLogs.map(l => (
                                   <div key={l.id}>
                                     {editingLog?.id === l.id ? (
                                       <div className="edit-form">
                                         <p className="edit-title">{l.product_name}</p>
                                         <div className="qty-row">
-                                          <input type="number" className="qty-input" style={{ fontSize: 16 }} value={editingLog.quantity} onChange={e => setEditingLog(ev => ev ? { ...ev, quantity: parseInt(e.target.value) || 1 } : ev)} />
+                                          <input type="number" className="qty-input" style={{ fontSize: 16 }}
+                                            value={editingLog.quantity}
+                                            onChange={e => setEditingLog(ev => ev ? { ...ev, quantity: parseInt(e.target.value) || 1 } : ev)} />
                                         </div>
                                         <div className="unit-group">
                                           {unitOptions.map(u => (
-                                            <button key={u} className={`unit-btn ${editingLog.unit === u ? 'active' : ''}`} onClick={() => setEditingLog(ev => ev ? { ...ev, unit: u } : ev)}>{u}</button>
+                                            <button key={u} className={`unit-btn ${editingLog.unit === u ? 'active' : ''}`}
+                                              onClick={() => setEditingLog(ev => ev ? { ...ev, unit: u } : ev)}>{u}</button>
                                           ))}
                                         </div>
-                                        <input type="text" className="inp-bare" placeholder="หมายเหตุ" value={editingLog.note} onChange={e => setEditingLog(ev => ev ? { ...ev, note: e.target.value } : ev)} />
+                                        <input type="text" className="inp-bare" placeholder="หมายเหตุ"
+                                          value={editingLog.note}
+                                          onChange={e => setEditingLog(ev => ev ? { ...ev, note: e.target.value } : ev)} />
                                         <div style={{ display: 'flex', gap: 8 }}>
                                           <button className="btn btn-primary btn-md" style={{ flex: 1 }} onClick={handleUpdateLog}>บันทึก</button>
                                           <button className="btn btn-ghost btn-md" style={{ flex: 1 }} onClick={() => setEditingLog(null)}>ยกเลิก</button>
@@ -1474,7 +1469,8 @@ export default function ScanPage() {
                                         </div>
                                         <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexShrink: 0 }}>
                                           {l.pallet_image_url && (
-                                            <img src={l.pallet_image_url} alt="pallet" className="pallet-thumb" onClick={() => window.open(l.pallet_image_url!, '_blank')} />
+                                            <img src={l.pallet_image_url} alt="pallet" className="pallet-thumb"
+                                              onClick={() => window.open(l.pallet_image_url!, '_blank')} />
                                           )}
                                           <button className="btn btn-ghost btn-sm" onClick={() => setEditingLog(l)}>✏️</button>
                                           <button className="btn btn-danger btn-sm" onClick={() => handleDeleteLog(l.id)}>🗑</button>
