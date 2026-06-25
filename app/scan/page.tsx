@@ -32,7 +32,8 @@ type ScanEntry = {
   quantity: number
   unit: string
   note: string
-  mfgDate: string   // ← NEW: วันผลิต
+  mfgDate: string
+  expDate: string
 }
 
 type ScanLog = {
@@ -48,9 +49,35 @@ type ScanLog = {
   quantity: number
   note: string
   session_label: string
-  pallet_image_url: string | null   // ← NEW
-  mfg_date: string | null           // ← NEW
+  pallet_image_url: string | null
+  mfg_date: string | null
+  exp_date: string | null
+  case_number: number | null
+  total_cases: number | null
   created_at: string
+}
+
+// ── Auto-format date input (dd/mm/yyyy) ──
+function useDateInput(initial = '') {
+  const [value, setValue] = useState(initial)
+
+  const handleChange = useCallback((raw: string) => {
+    // Strip non-digits
+    const digits = raw.replace(/\D/g, '')
+    let formatted = ''
+    if (digits.length <= 2) {
+      formatted = digits
+    } else if (digits.length <= 4) {
+      formatted = digits.slice(0, 2) + '/' + digits.slice(2)
+    } else {
+      formatted = digits.slice(0, 2) + '/' + digits.slice(2, 4) + '/' + digits.slice(4, 8)
+    }
+    setValue(formatted)
+  }, [])
+
+  const reset = useCallback(() => setValue(''), [])
+
+  return { value, handleChange, reset, setValue }
 }
 
 export default function ScanPage() {
@@ -58,7 +85,6 @@ export default function ScanPage() {
   const streamRef = useRef<MediaStream | null>(null)
   const readerRef = useRef<BrowserMultiFormatReader | null>(null)
 
-  // ── Photo capture refs ──
   const photoVideoRef = useRef<HTMLVideoElement>(null)
   const photoStreamRef = useRef<MediaStream | null>(null)
   const photoCanvasRef = useRef<HTMLCanvasElement>(null)
@@ -86,10 +112,16 @@ export default function ScanPage() {
 
   // ── Pallet photo state ──
   const [palletPhotoMode, setPalletPhotoMode] = useState<'idle' | 'camera' | 'preview'>('idle')
-  const [palletImageDataUrl, setPalletImageDataUrl] = useState<string | null>(null)  // base64 preview
-  const [palletImageUrl, setPalletImageUrl] = useState<string | null>(null)           // supabase URL after upload
+  const [palletImageDataUrl, setPalletImageDataUrl] = useState<string | null>(null)
+  const [palletImageUrl, setPalletImageUrl] = useState<string | null>(null)
   const [palletCameraError, setPalletCameraError] = useState('')
   const [uploadingPhoto, setUploadingPhoto] = useState(false)
+
+  // ── Pallet case count ──
+  const [totalCasesInput, setTotalCasesInput] = useState('')
+  const [totalCases, setTotalCases] = useState<number>(0)
+  const [currentCaseNumber, setCurrentCaseNumber] = useState<number>(1)
+  const [caseConfirmed, setCaseConfirmed] = useState(false)
 
   const [logs, setLogs] = useState<ScanLog[]>([])
   const [loadingLogs, setLoadingLogs] = useState(false)
@@ -97,7 +129,6 @@ export default function ScanPage() {
   const [filterLabel, setFilterLabel] = useState('')
   const [allLabels, setAllLabels] = useState<string[]>([])
 
-  // ── Share state ──
   const [sharing, setSharing] = useState(false)
   const [shareMsg, setShareMsg] = useState('')
 
@@ -115,6 +146,23 @@ export default function ScanPage() {
     const savedTheme = localStorage.getItem('rsm_theme') as Theme | null
     if (savedTheme) setTheme(savedTheme)
   }, [router])
+
+  // ── iOS zoom fix: ensure no input < 16px and viewport is correct ──
+  useEffect(() => {
+    const meta = document.querySelector('meta[name="viewport"]')
+    if (meta) {
+      meta.setAttribute('content', 'width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no')
+    } else {
+      const m = document.createElement('meta')
+      m.name = 'viewport'
+      m.content = 'width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no'
+      document.head.appendChild(m)
+    }
+    return () => {
+      const m = document.querySelector('meta[name="viewport"]')
+      if (m) m.setAttribute('content', 'width=device-width, initial-scale=1')
+    }
+  }, [])
 
   const toggleTheme = () => {
     setTheme(prev => {
@@ -192,11 +240,9 @@ export default function ScanPage() {
     setPalletPhotoMode('preview')
   }, [stopPhotoCamera])
 
-  // Upload pallet image to Supabase Storage
   const uploadPalletImage = useCallback(async (dataUrl: string): Promise<string | null> => {
     try {
       setUploadingPhoto(true)
-      // Convert base64 to Blob
       const res = await fetch(dataUrl)
       const blob = await res.blob()
       const fileName = `pallet_${employeeId}_${Date.now()}.jpg`
@@ -247,7 +293,7 @@ export default function ScanPage() {
 
   // ── Barcode camera useEffect ──
   useEffect(() => {
-    if (!scanning || !sessionConfirmed) return
+    if (!scanning || !sessionConfirmed || !caseConfirmed) return
     setCameraError('')
     let cancelled = false
     const startCamera = async () => {
@@ -308,7 +354,7 @@ export default function ScanPage() {
     }
     startCamera()
     return () => { cancelled = true; stopCamera() }
-  }, [scanning, sessionConfirmed, stopCamera])
+  }, [scanning, sessionConfirmed, caseConfirmed, stopCamera])
 
   const fetchByBarcode = async (barcode: string) => {
     setNotFound(false); setCurrentEntry(null)
@@ -342,7 +388,7 @@ export default function ScanPage() {
     if (priceData.barcode_case === cleaned) barcodeType = 'case'
     else if (priceData.barcode_pack === cleaned) barcodeType = 'pack'
     const defaultUnit = barcodeType === 'case' ? 'ลัง' : barcodeType === 'pack' ? 'แพ็ค' : 'ชิ้น'
-    setCurrentEntry({ priceItem: mergedItem, barcodeType, quantity: 1, unit: defaultUnit, note: '', mfgDate: '' })
+    setCurrentEntry({ priceItem: mergedItem, barcodeType, quantity: 1, unit: defaultUnit, note: '', mfgDate: '', expDate: '' })
   }
 
   const handleManualSearch = async () => {
@@ -353,7 +399,7 @@ export default function ScanPage() {
     setSearching(false)
   }
 
-  const buildRecord = (e: ScanEntry) => ({
+  const buildRecord = (e: ScanEntry, caseNum: number, total: number) => ({
     employee_id: employeeId,
     employee_name: employeeName,
     barcode: e.barcodeType === 'piece' ? e.priceItem.barcode_piece : e.barcodeType === 'case' ? e.priceItem.barcode_case : e.priceItem.barcode_pack,
@@ -365,18 +411,21 @@ export default function ScanPage() {
     quantity: e.quantity,
     note: e.note,
     session_label: sessionLabel,
-    pallet_image_url: palletImageUrl || null,   // ← NEW
-    mfg_date: e.mfgDate || null,                // ← NEW
+    pallet_image_url: palletImageUrl || null,
+    mfg_date: e.mfgDate || null,
+    exp_date: e.expDate || null,
+    case_number: caseNum,
+    total_cases: total,
   })
 
   const handleSaveNow = async () => {
     if (!currentEntry || !employeeId) return
     setSavingNow(true)
-    const record = buildRecord(currentEntry)
+    const record = buildRecord(currentEntry, currentCaseNumber, totalCases)
     const { error } = await supabase.from('scan_logs').insert([record]).select()
     if (error) { console.error('code:', error.code, 'message:', error.message); setSavingNow(false); return }
     setSavingNow(false); setCurrentEntry(null); setNotFound(false); setManualBarcode('')
-    setSuccessMsg('✅ บันทึกสำเร็จ 1 รายการ')
+    setSuccessMsg(`✅ บันทึกสำเร็จ — ลัง ${currentCaseNumber}/${totalCases}`)
     setTimeout(() => { setSuccessMsg(''); setScanning(true) }, 1800)
   }
 
@@ -390,12 +439,30 @@ export default function ScanPage() {
   const handleSaveAll = async () => {
     if (entries.length === 0 || !employeeId) return
     setSaving(true)
-    const records = entries.map(e => buildRecord(e))
+    const records = entries.map(e => buildRecord(e, currentCaseNumber, totalCases))
     const { error } = await supabase.from('scan_logs').insert(records)
     if (error) { console.error(String(error)); setSaving(false); return }
-    setSuccessMsg(`✅ บันทึกสำเร็จ ${records.length} รายการ`)
+    setSuccessMsg(`✅ บันทึกสำเร็จ ${records.length} รายการ (ลัง ${currentCaseNumber}/${totalCases})`)
     setEntries([]); setSaving(false)
     setTimeout(() => setSuccessMsg(''), 3000)
+  }
+
+  // ── Confirm current case done, move to next ──
+  const handleCaseDone = () => {
+    if (currentCaseNumber >= totalCases) {
+      // All cases done
+      setSuccessMsg(`✅ ครบทุกลัง ${totalCases}/${totalCases} แล้ว!`)
+      setTimeout(() => setSuccessMsg(''), 3000)
+      return
+    }
+    const next = currentCaseNumber + 1
+    setCurrentCaseNumber(next)
+    setCurrentEntry(null)
+    setNotFound(false)
+    setManualBarcode('')
+    setEntries([])
+    setSuccessMsg(`✅ ลังที่ ${currentCaseNumber} เสร็จแล้ว → เริ่มลังที่ ${next}/${totalCases}`)
+    setTimeout(() => { setSuccessMsg(''); setScanning(true) }, 1800)
   }
 
   const handleDeleteEntry = (idx: number) => setEntries(prev => prev.filter((_, i) => i !== idx))
@@ -425,34 +492,11 @@ export default function ScanPage() {
     return filtered
   }
 
-  // ── MFG Date helpers ──
-  // Quick-pick months: current + 11 months back
-  const mfgMonthOptions = (() => {
-    const opts: { label: string; value: string }[] = []
-    const now = new Date()
-    for (let i = 0; i < 24; i++) {
-      const d = new Date(now.getFullYear(), now.getMonth() - i, 1)
-      const y = d.getFullYear()
-      const m = String(d.getMonth() + 1).padStart(2, '0')
-      // Display as MM/YYYY Thai Buddhist Era
-      const thYear = y + 543
-      opts.push({ label: `${m}/${thYear}`, value: `${y}-${m}` })
-    }
-    return opts
-  })()
-
-  const formatMfgDate = (val: string) => {
-    if (!val) return ''
-    const [y, m] = val.split('-')
-    if (!y || !m) return val
-    return `${m}/${parseInt(y) + 543}`
-  }
-
   // ── CSV ──
   const buildCsvBlob = (filtered: ScanLog[]): Blob => {
-    const header = 'วันที่,รหัสพนักงาน,ชื่อพนักงาน,หัวข้อ,รหัสสินค้า,ชื่อสินค้า,แบรนด์,ขนาด,จำนวน,หน่วย,วันผลิต,หมายเหตุ,รูปพาเลท\n'
+    const header = 'วันที่,รหัสพนักงาน,ชื่อพนักงาน,หัวข้อ,ลังที่,จากลังทั้งหมด,รหัสสินค้า,ชื่อสินค้า,แบรนด์,ขนาด,จำนวน,หน่วย,วันผลิต,วันหมดอายุ,หมายเหตุ,รูปพาเลท\n'
     const rows = filtered.map(l =>
-      `${new Date(l.created_at).toLocaleString('th-TH')},${l.employee_id},${l.employee_name},${l.session_label || ''},${l.item_code},${l.product_name},${l.brand},${l.size},${l.quantity},${l.unit},${l.mfg_date ? formatMfgDate(l.mfg_date) : ''},${l.note},${l.pallet_image_url || ''}`
+      `${new Date(l.created_at).toLocaleString('th-TH')},${l.employee_id},${l.employee_name},${l.session_label || ''},${l.case_number ?? ''},${l.total_cases ?? ''},${l.item_code},${l.product_name},${l.brand},${l.size},${l.quantity},${l.unit},${l.mfg_date || ''},${l.exp_date || ''},${l.note},${l.pallet_image_url || ''}`
     ).join('\n')
     return new Blob(['\uFEFF' + header + rows], { type: 'text/csv;charset=utf-8;' })
   }
@@ -552,72 +596,55 @@ export default function ScanPage() {
     )
   }
 
-  // ── MFG Date Picker Component ──
-  const MfgDatePicker = ({ value, onChange }: { value: string; onChange: (v: string) => void }) => {
-    const [open, setOpen] = useState(false)
+  // ── Date Input Component (dd/mm/yyyy auto-slash) ──
+  const DateInput = ({
+    value,
+    onChange,
+    placeholder,
+    icon,
+  }: {
+    value: string
+    onChange: (v: string) => void
+    placeholder: string
+    icon: string
+  }) => {
+    const handleKey = (e: React.ChangeEvent<HTMLInputElement>) => {
+      const digits = e.target.value.replace(/\D/g, '')
+      let formatted = ''
+      if (digits.length <= 2) {
+        formatted = digits
+      } else if (digits.length <= 4) {
+        formatted = digits.slice(0, 2) + '/' + digits.slice(2)
+      } else {
+        formatted = digits.slice(0, 2) + '/' + digits.slice(2, 4) + '/' + digits.slice(4, 8)
+      }
+      onChange(formatted)
+    }
     return (
       <div style={{ position: 'relative' }}>
-        <button
-          type="button"
-          onClick={() => setOpen(o => !o)}
+        <span style={{ position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)', fontSize: 15, pointerEvents: 'none' }}>{icon}</span>
+        <input
+          type="text"
+          inputMode="numeric"
+          value={value}
+          onChange={handleKey}
+          placeholder={placeholder}
+          maxLength={10}
           style={{
-            width: '100%', padding: '11px 14px', borderRadius: 10,
-            background: 'var(--bg3)', border: `1px solid ${value ? 'var(--accent)' : 'var(--border)'}`,
-            color: value ? 'var(--accent)' : 'var(--text5)', fontSize: 14, fontWeight: value ? 600 : 400,
-            fontFamily: "'Sarabun', sans-serif", cursor: 'pointer',
-            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            width: '100%',
+            background: 'var(--bg3)',
+            border: `1px solid ${value ? 'var(--accent)' : 'var(--border)'}`,
+            borderRadius: 10,
+            color: value ? 'var(--accent)' : 'var(--text)',
+            fontSize: 16, // 16px prevents iOS zoom
+            fontFamily: "'IBM Plex Mono', monospace",
+            padding: '10px 12px 10px 36px',
+            outline: 'none',
+            fontWeight: value ? 600 : 400,
+            letterSpacing: value ? '0.06em' : 'normal',
             transition: 'border-color 0.15s',
           }}
-        >
-          <span>{value ? `📅 ${formatMfgDate(value)}` : '📅 เลือกวันผลิต (ถ้ามี)'}</span>
-          <span style={{ fontSize: 12, opacity: 0.6 }}>{open ? '▲' : '▼'}</span>
-        </button>
-
-        {open && (
-          <div style={{
-            position: 'absolute', top: 'calc(100% + 6px)', left: 0, right: 0, zIndex: 50,
-            background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12,
-            boxShadow: '0 8px 32px rgba(0,0,0,0.3)', overflow: 'hidden',
-          }}>
-            {/* Clear option */}
-            <button
-              type="button"
-              onClick={() => { onChange(''); setOpen(false) }}
-              style={{
-                width: '100%', padding: '11px 14px', background: 'none',
-                border: 'none', borderBottom: '1px solid var(--border)',
-                color: 'var(--text4)', fontSize: 13, cursor: 'pointer',
-                fontFamily: "'Sarabun', sans-serif", textAlign: 'left',
-              }}
-            >
-              — ไม่ระบุวันผลิต
-            </button>
-
-            {/* Month grid — 3 columns */}
-            <div style={{
-              display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)',
-              gap: 0, maxHeight: 260, overflowY: 'auto',
-            }}>
-              {mfgMonthOptions.map(opt => (
-                <button
-                  key={opt.value}
-                  type="button"
-                  onClick={() => { onChange(opt.value); setOpen(false) }}
-                  style={{
-                    padding: '10px 6px', background: value === opt.value ? 'var(--accent2)' : 'none',
-                    border: 'none', borderBottom: '1px solid var(--border2)',
-                    color: value === opt.value ? '#fff' : 'var(--text3)',
-                    fontSize: 13, fontWeight: value === opt.value ? 700 : 400,
-                    cursor: 'pointer', fontFamily: "'IBM Plex Mono', monospace",
-                    textAlign: 'center', transition: 'background 0.1s',
-                  }}
-                >
-                  {opt.label}
-                </button>
-              ))}
-            </div>
-          </div>
-        )}
+        />
       </div>
     )
   }
@@ -628,24 +655,15 @@ export default function ScanPage() {
       <div style={{ fontSize: 11, color: 'var(--text4)', fontFamily: "'IBM Plex Mono', monospace", letterSpacing: '0.06em', textTransform: 'uppercase' }}>
         📸 รูปถ่ายพาเลท (ไม่บังคับ)
       </div>
-
-      {/* No photo yet */}
       {palletPhotoMode === 'idle' && !palletImageDataUrl && (
-        <button
-          type="button"
-          className="btn btn-ghost btn-md"
-          style={{ width: '100%', border: `2px dashed var(--border)`, borderRadius: 12, padding: '16px', fontSize: 14 }}
-          onClick={() => setPalletPhotoMode('camera')}
-        >
+        <button type="button" className="btn btn-ghost btn-md" style={{ width: '100%', border: `2px dashed var(--border)`, borderRadius: 12, padding: '16px', fontSize: 16 }} onClick={() => setPalletPhotoMode('camera')}>
           📷 ถ่ายรูปพาเลท
         </button>
       )}
-
-      {/* Camera live view */}
       {palletPhotoMode === 'camera' && (
         <div style={{ borderRadius: 12, overflow: 'hidden', border: '1px solid var(--border)' }}>
           {palletCameraError ? (
-            <div style={{ padding: '24px 16px', textAlign: 'center', color: 'var(--text3)', fontSize: 13 }}>
+            <div style={{ padding: '24px 16px', textAlign: 'center', color: 'var(--text3)', fontSize: 14 }}>
               <div style={{ fontSize: 36, marginBottom: 10 }}>📵</div>
               <p>{palletCameraError}</p>
               <button className="btn btn-ghost btn-sm" style={{ marginTop: 10 }} onClick={() => setPalletPhotoMode('idle')}>ยกเลิก</button>
@@ -653,17 +671,9 @@ export default function ScanPage() {
           ) : (
             <>
               <div style={{ position: 'relative', background: '#000', aspectRatio: '4/3' }}>
-                <video
-                  ref={photoVideoRef}
-                  playsInline muted autoPlay
-                  style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }}
-                />
-                {/* Corner guides */}
+                <video ref={photoVideoRef} playsInline muted autoPlay style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />
                 {(['tl','tr','bl','br'] as const).map(pos => (
-                  <div key={pos} style={{
-                    position: 'absolute',
-                    width: 22, height: 22,
-                    borderColor: '#34d399', borderStyle: 'solid', opacity: 0.9,
+                  <div key={pos} style={{ position: 'absolute', width: 22, height: 22, borderColor: '#34d399', borderStyle: 'solid', opacity: 0.9,
                     ...(pos === 'tl' ? { top: 14, left: 14, borderWidth: '3px 0 0 3px', borderRadius: '3px 0 0 0' } :
                        pos === 'tr' ? { top: 14, right: 14, borderWidth: '3px 3px 0 0', borderRadius: '0 3px 0 0' } :
                        pos === 'bl' ? { bottom: 14, left: 14, borderWidth: '0 0 3px 3px', borderRadius: '0 0 0 3px' } :
@@ -673,55 +683,33 @@ export default function ScanPage() {
               </div>
               <canvas ref={photoCanvasRef} style={{ display: 'none' }} />
               <div style={{ display: 'flex', gap: 8, padding: '10px 12px' }}>
-                <button className="btn btn-success btn-md" style={{ flex: 1 }} onClick={capturePhoto}>
-                  📸 ถ่ายรูป
-                </button>
-                <button className="btn btn-ghost btn-md" onClick={() => { stopPhotoCamera(); setPalletPhotoMode('idle') }}>
-                  ยกเลิก
-                </button>
+                <button className="btn btn-success btn-md" style={{ flex: 1 }} onClick={capturePhoto}>📸 ถ่ายรูป</button>
+                <button className="btn btn-ghost btn-md" onClick={() => { stopPhotoCamera(); setPalletPhotoMode('idle') }}>ยกเลิก</button>
               </div>
             </>
           )}
         </div>
       )}
-
-      {/* Preview captured photo */}
       {palletPhotoMode === 'preview' && palletImageDataUrl && (
         <div style={{ borderRadius: 12, overflow: 'hidden', border: '1px solid var(--border)' }}>
           <img src={palletImageDataUrl} alt="pallet preview" style={{ width: '100%', display: 'block', aspectRatio: '4/3', objectFit: 'cover' }} />
           <div style={{ display: 'flex', gap: 8, padding: '10px 12px', background: 'var(--bg3)' }}>
-            <button
-              className="btn btn-primary btn-md"
-              style={{ flex: 1 }}
-              onClick={handleConfirmPalletPhoto}
-              disabled={uploadingPhoto}
-            >
+            <button className="btn btn-primary btn-md" style={{ flex: 1 }} onClick={handleConfirmPalletPhoto} disabled={uploadingPhoto}>
               {uploadingPhoto ? '⏳ กำลังอัปโหลด...' : '✅ ใช้รูปนี้'}
             </button>
-            <button className="btn btn-ghost btn-md" onClick={() => { setPalletImageDataUrl(null); setPalletPhotoMode('camera') }}>
-              🔄 ถ่ายใหม่
-            </button>
+            <button className="btn btn-ghost btn-md" onClick={() => { setPalletImageDataUrl(null); setPalletPhotoMode('camera') }}>🔄 ถ่ายใหม่</button>
           </div>
         </div>
       )}
-
-      {/* Uploaded / confirmed */}
       {palletPhotoMode === 'idle' && palletImageUrl && (
         <div style={{ borderRadius: 12, overflow: 'hidden', border: '1px solid rgba(52,211,153,0.3)' }}>
           <img src={palletImageUrl} alt="pallet" style={{ width: '100%', display: 'block', aspectRatio: '4/3', objectFit: 'cover' }} />
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px', background: 'rgba(52,211,153,0.06)' }}>
-            <span style={{ fontSize: 12, color: '#34d399', fontWeight: 600 }}>✅ บันทึกรูปพาเลทแล้ว</span>
-            <button
-              className="btn btn-ghost btn-sm"
-              onClick={() => { setPalletImageUrl(null); setPalletImageDataUrl(null); setPalletPhotoMode('camera') }}
-            >
-              🔄 เปลี่ยนรูป
-            </button>
+            <span style={{ fontSize: 13, color: '#34d399', fontWeight: 600 }}>✅ บันทึกรูปพาเลทแล้ว</span>
+            <button className="btn btn-ghost btn-sm" onClick={() => { setPalletImageUrl(null); setPalletImageDataUrl(null); setPalletPhotoMode('camera') }}>🔄 เปลี่ยนรูป</button>
           </div>
         </div>
       )}
-
-      {/* Idle but has local preview not yet confirmed */}
       {palletPhotoMode === 'idle' && palletImageDataUrl && !palletImageUrl && (
         <div style={{ borderRadius: 12, overflow: 'hidden', border: '1px solid var(--border)' }}>
           <img src={palletImageDataUrl} alt="pallet preview" style={{ width: '100%', display: 'block', aspectRatio: '4/3', objectFit: 'cover' }} />
@@ -736,6 +724,67 @@ export default function ScanPage() {
     </div>
   )
 
+  // ── Case Progress Bar ──
+  const CaseProgressBar = () => (
+    <div style={{
+      background: isDark ? 'rgba(56,189,248,0.06)' : 'rgba(2,132,199,0.05)',
+      border: `1px solid ${isDark ? 'rgba(56,189,248,0.18)' : 'rgba(2,132,199,0.18)'}`,
+      borderRadius: 14,
+      padding: '12px 16px',
+      display: 'flex',
+      flexDirection: 'column',
+      gap: 10,
+    }}>
+      {/* Header row */}
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <span style={{ fontSize: 12, color: 'var(--text4)', fontFamily: "'IBM Plex Mono', monospace", letterSpacing: '0.06em', textTransform: 'uppercase' }}>
+          ลังที่กำลังนับ
+        </span>
+        <span style={{ fontSize: 22, fontWeight: 800, fontFamily: "'IBM Plex Mono', monospace", color: 'var(--accent)', letterSpacing: '-0.02em' }}>
+          {currentCaseNumber}<span style={{ fontSize: 13, fontWeight: 500, color: 'var(--text4)' }}>/{totalCases}</span>
+        </span>
+      </div>
+
+      {/* Progress bar */}
+      <div style={{ height: 6, background: 'var(--border)', borderRadius: 99, overflow: 'hidden' }}>
+        <div style={{
+          height: '100%',
+          width: `${(currentCaseNumber / totalCases) * 100}%`,
+          background: 'linear-gradient(90deg, var(--accent2), var(--accent))',
+          borderRadius: 99,
+          transition: 'width 0.4s ease',
+        }} />
+      </div>
+
+      {/* Dot indicators — show max 10 */}
+      {totalCases <= 20 && (
+        <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+          {Array.from({ length: totalCases }, (_, i) => i + 1).map(n => (
+            <div key={n} style={{
+              width: 20, height: 20, borderRadius: 6,
+              background: n < currentCaseNumber ? '#10b981' : n === currentCaseNumber ? 'var(--accent2)' : 'var(--border)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: 9, fontWeight: 700, color: n <= currentCaseNumber ? '#fff' : 'var(--text5)',
+              fontFamily: "'IBM Plex Mono', monospace",
+              transition: 'background 0.3s',
+            }}>
+              {n < currentCaseNumber ? '✓' : n}
+            </div>
+          ))}
+        </div>
+      )}
+
+      <button
+        className="btn btn-ghost btn-sm"
+        style={{ alignSelf: 'flex-end', fontSize: 12, color: '#34d399', borderColor: 'rgba(52,211,153,0.3)' }}
+        onClick={handleCaseDone}
+        disabled={currentCaseNumber > totalCases}
+      >
+        {currentCaseNumber >= totalCases ? '🏁 ครบทุกลังแล้ว' : `✅ ลังที่ ${currentCaseNumber} เสร็จ → ลังที่ ${currentCaseNumber + 1}`}
+      </button>
+    </div>
+  )
+
   return (
     <>
       <style>{`
@@ -744,6 +793,9 @@ export default function ScanPage() {
         html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
         html, body { overflow-x: hidden; width: 100%; }
         body { font-family: 'Sarabun', sans-serif; background: var(--bg); color: var(--text); }
+
+        /* ── iOS zoom fix: all inputs must be >= 16px ── */
+        input, select, textarea { font-size: 16px !important; }
 
         .scan-root {
           min-height: 100dvh; width: 100%; background: var(--bg);
@@ -827,13 +879,13 @@ export default function ScanPage() {
 
         .inp {
           width: 100%; background: var(--bg3); border: 1px solid var(--border);
-          border-radius: 10px; color: var(--text); font-size: 15px;
+          border-radius: 10px; color: var(--text); font-size: 16px;
           font-family: 'Sarabun', sans-serif; padding: 10px 12px 10px 34px;
           outline: none; transition: border-color 0.15s, box-shadow 0.15s;
         }
         .inp:focus { border-color: var(--accent); box-shadow: 0 0 0 3px ${isDark ? 'rgba(56,189,248,0.08)' : 'rgba(2,132,199,0.08)'}; }
         .inp::placeholder { color: var(--text5); }
-        .inp-bare { background: var(--bg3); border: 1px solid var(--border); border-radius: 10px; color: var(--text); font-size: 15px; font-family: 'Sarabun', sans-serif; padding: 10px 12px; outline: none; transition: border-color 0.15s; width: 100%; }
+        .inp-bare { background: var(--bg3); border: 1px solid var(--border); border-radius: 10px; color: var(--text); font-size: 16px; font-family: 'Sarabun', sans-serif; padding: 10px 12px; outline: none; transition: border-color 0.15s; width: 100%; }
         .inp-bare:focus { border-color: var(--accent); }
         .inp-bare::placeholder { color: var(--text5); }
 
@@ -842,7 +894,7 @@ export default function ScanPage() {
         .btn:active:not(:disabled) { transform: scale(0.97); }
         .btn-sm  { font-size: 13px; padding: 7px 14px; }
         .btn-md  { font-size: 14px; padding: 10px 16px; }
-        .btn-lg  { font-size: 15px; padding: 13px 20px; width: 100%; }
+        .btn-lg  { font-size: 16px; padding: 13px 20px; width: 100%; }
         .btn-primary { background: var(--accent2); color: #fff; }
         .btn-primary:hover:not(:disabled) { background: var(--accent); }
         .btn-success { background: #10b981; color: #fff; }
@@ -851,7 +903,7 @@ export default function ScanPage() {
         .btn-ghost:hover:not(:disabled) { background: ${isDark ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.08)'}; }
         .btn-danger { background: rgba(239,68,68,0.1); color: #f87171; border: 1px solid rgba(239,68,68,0.2); }
         .btn-danger:hover:not(:disabled) { background: rgba(239,68,68,0.18); }
-        .btn-share { background: #06C755; color: #fff; font-size: 15px; padding: 13px 20px; width: 100%; }
+        .btn-share { background: #06C755; color: #fff; font-size: 16px; padding: 13px 20px; width: 100%; }
         .btn-share:hover:not(:disabled) { background: #05b04c; }
         .btn-share:disabled { opacity: 0.4; cursor: not-allowed; }
 
@@ -901,7 +953,7 @@ export default function ScanPage() {
         .log-date { font-size: 11px; color: var(--log-date); white-space: nowrap; font-family: 'IBM Plex Mono', monospace; }
 
         .filter-label { font-size: 11px; color: var(--text4); margin-bottom: 5px; font-family: 'IBM Plex Mono', monospace; letter-spacing: 0.04em; }
-        .select-inp { width: 100%; background: var(--bg3); border: 1px solid var(--border); border-radius: 10px; color: var(--text); font-size: 13px; padding: 9px 12px; outline: none; font-family: 'Sarabun', sans-serif; transition: border-color 0.15s; cursor: pointer; appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24'%3E%3Cpath fill='%2394a3b8' d='M7 10l5 5 5-5z'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 10px center; padding-right: 30px; }
+        .select-inp { width: 100%; background: var(--bg3); border: 1px solid var(--border); border-radius: 10px; color: var(--text); font-size: 16px; padding: 9px 12px; outline: none; font-family: 'Sarabun', sans-serif; transition: border-color 0.15s; cursor: pointer; appearance: none; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24'%3E%3Cpath fill='%2394a3b8' d='M7 10l5 5 5-5z'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 10px center; padding-right: 30px; }
         .select-inp:focus { border-color: var(--accent); }
 
         .edit-form { padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; background: var(--edit-bg); border-bottom: 1px solid var(--border); }
@@ -916,10 +968,11 @@ export default function ScanPage() {
         .group-header { padding: 8px 16px; font-size: 11px; font-weight: 700; color: var(--accent); letter-spacing: 0.06em; text-transform: uppercase; font-family: 'IBM Plex Mono', monospace; background: ${isDark ? 'rgba(56,189,248,0.05)' : 'rgba(2,132,199,0.04)'}; border-bottom: 1px solid var(--border2); border-top: 1px solid var(--border2); }
         .group-header:first-child { border-top: none; }
 
+        .case-group-header { padding: 7px 16px; font-size: 11px; font-weight: 700; color: #f59e0b; letter-spacing: 0.06em; font-family: 'IBM Plex Mono', monospace; background: ${isDark ? 'rgba(245,158,11,0.05)' : 'rgba(245,158,11,0.04)'}; border-bottom: 1px solid var(--border2); border-top: 1px solid var(--border2); display: flex; align-items: center; gap: 8px; }
+
         .action-divider { display: flex; align-items: center; gap: 10px; font-size: 11px; color: var(--text5); font-family: 'IBM Plex Mono', monospace; }
         .action-divider::before, .action-divider::after { content: ''; flex: 1; border-top: 1px solid var(--border); }
 
-        /* ── Pallet thumb in log ── */
         .pallet-thumb { width: 48px; height: 48px; border-radius: 8px; object-fit: cover; border: 1px solid var(--border); flex-shrink: 0; cursor: pointer; }
 
         @media (max-width: 400px) {
@@ -962,7 +1015,7 @@ export default function ScanPage() {
             <>
               {successMsg && !entries.length && <div className="success-bar">{successMsg}</div>}
 
-              {/* ── Step 1: ตั้งหัวข้อ + ถ่ายรูปพาเลท ── */}
+              {/* ── Step 1: ตั้งหัวข้อ + ถ่ายรูปพาเลท + จำนวนลัง ── */}
               {!sessionConfirmed ? (
                 <div className="card">
                   <div className="card-header accent">
@@ -985,31 +1038,57 @@ export default function ScanPage() {
                       }}
                     />
 
-                    {/* ── Pallet photo (in session setup) ── */}
+                    {/* ── Pallet photo ── */}
                     <PalletPhotoSection />
+
+                    {/* ── จำนวนลังในพาเลท ── */}
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+                      <div style={{ fontSize: 11, color: 'var(--text4)', fontFamily: "'IBM Plex Mono', monospace", letterSpacing: '0.06em', textTransform: 'uppercase' }}>
+                        📦 จำนวนลังในพาเลท
+                      </div>
+                      <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                        <div className="qty-row" style={{ flex: 1 }}>
+                          <button className="qty-btn" onClick={() => setTotalCasesInput(v => String(Math.max(1, parseInt(v || '1') - 1)))}>−</button>
+                          <input
+                            type="number"
+                            inputMode="numeric"
+                            className="qty-input"
+                            value={totalCasesInput}
+                            onChange={e => setTotalCasesInput(e.target.value)}
+                            placeholder="0"
+                            min={1}
+                          />
+                          <button className="qty-btn" onClick={() => setTotalCasesInput(v => String((parseInt(v || '0') || 0) + 1))}>+</button>
+                        </div>
+                        <span style={{ fontSize: 14, color: 'var(--text4)', fontWeight: 600, whiteSpace: 'nowrap' }}>ลัง</span>
+                      </div>
+                      {totalCasesInput && parseInt(totalCasesInput) > 0 && (
+                        <div style={{ fontSize: 12, color: 'var(--accent)', fontFamily: "'IBM Plex Mono', monospace" }}>
+                          จะนับสินค้าแยกทีละลัง: 1/{totalCasesInput} → {totalCasesInput}/{totalCasesInput}
+                        </div>
+                      )}
+                    </div>
 
                     <button
                       className="btn btn-primary btn-lg"
-                      disabled={!sessionInput.trim()}
+                      disabled={!sessionInput.trim() || !totalCasesInput || parseInt(totalCasesInput) < 1}
                       onClick={() => {
+                        const n = parseInt(totalCasesInput) || 1
                         setSessionLabel(sessionInput.trim())
+                        setTotalCases(n)
+                        setCurrentCaseNumber(1)
+                        setCaseConfirmed(true)
                         setSessionConfirmed(true)
                         setScanning(true)
                       }}
                     >
-                      ✅ ยืนยันหัวข้อ แล้วเริ่มสแกน
+                      ✅ ยืนยัน แล้วเริ่มสแกนลังที่ 1/{totalCasesInput || '?'}
                     </button>
-
-                    {palletImageUrl && (
-                      <div style={{ fontSize: 12, color: '#34d399', textAlign: 'center', fontWeight: 600 }}>
-                        📸 รูปพาเลทจะถูกบันทึกกับทุกรายการในหัวข้อนี้
-                      </div>
-                    )}
                   </div>
                 </div>
               ) : (
                 <>
-                  {/* Session badge */}
+                  {/* Session badge + case progress */}
                   <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 10 }}>
                     <div className="session-current" style={{ flex: 1 }}>
                       <span>📋 {sessionLabel}</span>
@@ -1023,15 +1102,27 @@ export default function ScanPage() {
                         stopCamera(); setScanning(false)
                         setSessionConfirmed(false); setSessionInput('')
                         setCurrentEntry(null); setNotFound(false); setManualBarcode('')
-                        setEntries([]); setPalletImageUrl(null); setPalletImageDataUrl(null); setPalletPhotoMode('idle')
+                        setEntries([])
+                        setPalletImageUrl(null); setPalletImageDataUrl(null); setPalletPhotoMode('idle')
+                        setTotalCasesInput(''); setTotalCases(0); setCurrentCaseNumber(1); setCaseConfirmed(false)
                       }}
                     >เปลี่ยนหัวข้อ</button>
                   </div>
 
+                  {/* Case progress */}
+                  {totalCases > 0 && <CaseProgressBar />}
+
                   {/* Camera Card */}
                   {scanning && (
                     <div className="card">
-                      <div className="card-header accent"><h2>📷 สแกนบาร์โค้ด</h2></div>
+                      <div className="card-header accent">
+                        <h2>📷 สแกนบาร์โค้ด</h2>
+                        {totalCases > 0 && (
+                          <span className="badge" style={{ color: '#f59e0b', borderColor: '#78350f', background: '#451a0355' }}>
+                            ลัง {currentCaseNumber}/{totalCases}
+                          </span>
+                        )}
+                      </div>
                       {cameraError ? (
                         <div className="cam-error">
                           <span className="icon">📵</span>
@@ -1076,10 +1167,17 @@ export default function ScanPage() {
                     <div className="card">
                       <div className="card-header">
                         <h2>กรอกข้อมูลสินค้า</h2>
-                        {(() => {
-                          const b = barcodeBadge(currentEntry.barcodeType)
-                          return <span className="badge" style={{ color: b.color, borderColor: b.color + '44', background: b.color + '14' }}>{b.label}</span>
-                        })()}
+                        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                          {totalCases > 0 && (
+                            <span className="badge" style={{ color: '#f59e0b', borderColor: '#78350f44', background: '#f59e0b14' }}>
+                              ลัง {currentCaseNumber}/{totalCases}
+                            </span>
+                          )}
+                          {(() => {
+                            const b = barcodeBadge(currentEntry.barcodeType)
+                            return <span className="badge" style={{ color: b.color, borderColor: b.color + '44', background: b.color + '14' }}>{b.label}</span>
+                          })()}
+                        </div>
                       </div>
                       <div className="card-body" style={{ display: 'flex', flexDirection: 'column', gap: 13 }}>
                         <p className="product-title">{currentEntry.priceItem.item_name}</p>
@@ -1111,19 +1209,32 @@ export default function ScanPage() {
                           </div>
                         </div>
 
-                        {/* ── วันผลิต ← NEW ── */}
+                        {/* ── วันผลิต ── */}
                         <div>
                           <div className="section-label">วันผลิต / MFG Date</div>
-                          <MfgDatePicker
+                          <DateInput
                             value={currentEntry.mfgDate}
                             onChange={v => setCurrentEntry(e => e ? { ...e, mfgDate: v } : e)}
+                            placeholder="วว/ดด/ปปปป เช่น 01/06/2568"
+                            icon="🏭"
+                          />
+                        </div>
+
+                        {/* ── วันหมดอายุ ── */}
+                        <div>
+                          <div className="section-label">วันหมดอายุ / EXP Date</div>
+                          <DateInput
+                            value={currentEntry.expDate}
+                            onChange={v => setCurrentEntry(e => e ? { ...e, expDate: v } : e)}
+                            placeholder="วว/ดด/ปปปป เช่น 01/06/2570"
+                            icon="⏰"
                           />
                         </div>
 
                         <input type="text" className="inp-bare" placeholder="หมายเหตุ (ถ้ามี)" value={currentEntry.note} onChange={ev => setCurrentEntry(e => e ? { ...e, note: ev.target.value } : e)} />
 
                         <button className="btn btn-success btn-lg" onClick={handleSaveNow} disabled={savingNow}>
-                          {savingNow ? 'กำลังบันทึก...' : '💾 บันทึกทันที'}
+                          {savingNow ? 'กำลังบันทึก...' : `💾 บันทึกทันที${totalCases > 0 ? ` (ลัง ${currentCaseNumber}/${totalCases})` : ''}`}
                         </button>
                         <div style={{ display: 'flex', gap: 8 }}>
                           <button className="btn btn-primary btn-md" style={{ flex: 1 }} onClick={handleAddEntry}>➕ เก็บในรายการ</button>
@@ -1137,7 +1248,7 @@ export default function ScanPage() {
                   {entries.length > 0 && (
                     <div className="card">
                       <div className="card-header">
-                        <h2>📦 รายการรอบันทึก</h2>
+                        <h2>📦 รายการรอบันทึก{totalCases > 0 ? ` — ลัง ${currentCaseNumber}/${totalCases}` : ''}</h2>
                         <span className="badge" style={{ color: '#93c5fd', borderColor: '#1e3a8a', background: '#1e3a8a55' }}>{entries.length} รายการ</span>
                       </div>
                       <div className="scroll-area">
@@ -1147,7 +1258,8 @@ export default function ScanPage() {
                               <div className="entry-name">{e.priceItem.item_name}</div>
                               <div className="entry-meta">
                                 {e.quantity} {e.unit}
-                                {e.mfgDate ? ` · MFG ${formatMfgDate(e.mfgDate)}` : ''}
+                                {e.mfgDate ? ` · MFG ${e.mfgDate}` : ''}
+                                {e.expDate ? ` · EXP ${e.expDate}` : ''}
                                 {e.note ? ` · ${e.note}` : ''}
                               </div>
                             </div>
@@ -1156,10 +1268,15 @@ export default function ScanPage() {
                         ))}
                       </div>
                       {successMsg && <div className="success-bar" style={{ margin: '0 14px 12px' }}>{successMsg}</div>}
-                      <div style={{ padding: '0 14px 14px' }}>
+                      <div style={{ padding: '0 14px 14px', display: 'flex', flexDirection: 'column', gap: 8 }}>
                         <button className="btn btn-success btn-lg" onClick={handleSaveAll} disabled={saving}>
                           {saving ? 'กำลังบันทึก...' : `💾 บันทึกทั้งหมด ${entries.length} รายการ`}
                         </button>
+                        {totalCases > 0 && currentCaseNumber < totalCases && (
+                          <button className="btn btn-primary btn-lg" onClick={() => { handleSaveAll().then(() => handleCaseDone()) }}>
+                            ✅ บันทึก + ไปลังที่ {currentCaseNumber + 1}/{totalCases}
+                          </button>
+                        )}
                       </div>
                     </div>
                   )}
@@ -1184,33 +1301,56 @@ export default function ScanPage() {
               ) : (
                 <div className="scroll-area">
                   {(() => {
-                    const groups: Record<string, ScanLog[]> = {}
-                    logs.forEach(l => { const key = l.session_label || '(ไม่มีหัวข้อ)'; if (!groups[key]) groups[key] = []; groups[key].push(l) })
-                    return Object.entries(groups).map(([label, items]) => (
-                      <div key={label}>
-                        <div className="group-header">
-                          📋 {label} · {items.length} รายการ
-                          {/* Show pallet thumb if any item in group has a photo */}
-                          {items[0]?.pallet_image_url && (
-                            <img src={items[0].pallet_image_url} alt="pallet" className="pallet-thumb" style={{ display: 'inline-block', verticalAlign: 'middle', marginLeft: 8, width: 28, height: 28 }} onClick={() => window.open(items[0].pallet_image_url!, '_blank')} />
-                          )}
-                        </div>
-                        {items.map(l => (
-                          <div key={l.id} className="log-item">
-                            <div style={{ flex: 1 }}>
-                              <div className="log-name">{l.product_name}</div>
-                              <div className="log-meta">{l.item_code} · {l.brand} · {l.size}</div>
-                              <div className="log-qty">
-                                {l.quantity} {l.unit}
-                                {l.mfg_date ? <span style={{ color: 'var(--accent)', fontWeight: 600, marginLeft: 6 }}>MFG {formatMfgDate(l.mfg_date)}</span> : ''}
-                                {l.note ? ` · ${l.note}` : ''}
-                              </div>
-                            </div>
-                            <div className="log-date">{new Date(l.created_at).toLocaleDateString('th-TH', { day: '2-digit', month: '2-digit', year: '2-digit' })}</div>
+                    // Group by session_label → then by case_number
+                    const sessionGroups: Record<string, ScanLog[]> = {}
+                    logs.forEach(l => {
+                      const key = l.session_label || '(ไม่มีหัวข้อ)'
+                      if (!sessionGroups[key]) sessionGroups[key] = []
+                      sessionGroups[key].push(l)
+                    })
+                    return Object.entries(sessionGroups).map(([label, items]) => {
+                      // sub-group by case_number
+                      const caseGroups: Record<string, ScanLog[]> = {}
+                      items.forEach(l => {
+                        const ckey = l.case_number != null && l.total_cases != null
+                          ? `ลังที่ ${l.case_number}/${l.total_cases}`
+                          : '—'
+                        if (!caseGroups[ckey]) caseGroups[ckey] = []
+                        caseGroups[ckey].push(l)
+                      })
+                      return (
+                        <div key={label}>
+                          <div className="group-header">
+                            📋 {label} · {items.length} รายการ
+                            {items[0]?.pallet_image_url && (
+                              <img src={items[0].pallet_image_url} alt="pallet" style={{ display: 'inline-block', verticalAlign: 'middle', marginLeft: 8, width: 28, height: 28, borderRadius: 6, objectFit: 'cover' }} onClick={() => window.open(items[0].pallet_image_url!, '_blank')} />
+                            )}
                           </div>
-                        ))}
-                      </div>
-                    ))
+                          {Object.entries(caseGroups).map(([caseKey, caseLogs]) => (
+                            <div key={caseKey}>
+                              <div className="case-group-header">
+                                📦 {caseKey} · {caseLogs.length} รายการ
+                              </div>
+                              {caseLogs.map(l => (
+                                <div key={l.id} className="log-item">
+                                  <div style={{ flex: 1 }}>
+                                    <div className="log-name">{l.product_name}</div>
+                                    <div className="log-meta">{l.item_code} · {l.brand} · {l.size}</div>
+                                    <div className="log-qty">
+                                      {l.quantity} {l.unit}
+                                      {l.mfg_date ? <span style={{ color: '#10b981', fontWeight: 600, marginLeft: 6 }}>MFG {l.mfg_date}</span> : ''}
+                                      {l.exp_date ? <span style={{ color: '#f59e0b', fontWeight: 600, marginLeft: 6 }}>EXP {l.exp_date}</span> : ''}
+                                      {l.note ? ` · ${l.note}` : ''}
+                                    </div>
+                                  </div>
+                                  <div className="log-date">{new Date(l.created_at).toLocaleDateString('th-TH', { day: '2-digit', month: '2-digit', year: '2-digit' })}</div>
+                                </div>
+                              ))}
+                            </div>
+                          ))}
+                        </div>
+                      )
+                    })
                   })()}
                 </div>
               )}
@@ -1248,7 +1388,8 @@ export default function ScanPage() {
                   )}
                   <div className="share-tip">
                     💡 <strong>วิธีแชร์ไป LINE:</strong> กดปุ่มแชร์ → เลือก LINE → เลือกแชทหรือกลุ่มที่ต้องการ<br/>
-                    ไฟล์ CSV จะถูกส่งเป็นไฟล์แนบ เปิดได้ด้วย Excel หรือ Google Sheets
+                    ไฟล์ CSV จะถูกส่งเป็นไฟล์แนบ เปิดได้ด้วย Excel หรือ Google Sheets<br/>
+                    คอลัมน์ <strong>ลังที่ / จากลังทั้งหมด</strong> จะแสดงแยกชัดเจนแต่ละลัง
                   </div>
                 </div>
               </div>
@@ -1272,59 +1413,81 @@ export default function ScanPage() {
                 ) : (
                   <div className="scroll-area">
                     {(() => {
-                      const groups: Record<string, ScanLog[]> = {}
-                      logs.forEach(l => { const key = l.session_label || '(ไม่มีหัวข้อ)'; if (!groups[key]) groups[key] = []; groups[key].push(l) })
-                      return Object.entries(groups).map(([label, items]) => (
-                        <div key={label}>
-                          <div className="group-header">
-                            📋 {label} · {items.length} รายการ
-                            {items[0]?.pallet_image_url && (
-                              <img src={items[0].pallet_image_url} alt="pallet" style={{ display: 'inline-block', verticalAlign: 'middle', marginLeft: 8, width: 28, height: 28, borderRadius: 6, objectFit: 'cover', border: '1px solid rgba(52,211,153,0.3)', cursor: 'pointer' }} onClick={() => window.open(items[0].pallet_image_url!, '_blank')} />
-                            )}
-                          </div>
-                          {items.map(l => (
-                            <div key={l.id}>
-                              {editingLog?.id === l.id ? (
-                                <div className="edit-form">
-                                  <p className="edit-title">{l.product_name}</p>
-                                  <div className="qty-row">
-                                    <input type="number" className="qty-input" style={{ fontSize: 16 }} value={editingLog.quantity} onChange={e => setEditingLog(ev => ev ? { ...ev, quantity: parseInt(e.target.value) || 1 } : ev)} />
-                                  </div>
-                                  <div className="unit-group">
-                                    {unitOptions.map(u => (
-                                      <button key={u} className={`unit-btn ${editingLog.unit === u ? 'active' : ''}`} onClick={() => setEditingLog(ev => ev ? { ...ev, unit: u } : ev)}>{u}</button>
-                                    ))}
-                                  </div>
-                                  <input type="text" className="inp-bare" placeholder="หมายเหตุ" value={editingLog.note} onChange={e => setEditingLog(ev => ev ? { ...ev, note: e.target.value } : ev)} />
-                                  <div style={{ display: 'flex', gap: 8 }}>
-                                    <button className="btn btn-primary btn-md" style={{ flex: 1 }} onClick={handleUpdateLog}>บันทึก</button>
-                                    <button className="btn btn-ghost btn-md" style={{ flex: 1 }} onClick={() => setEditingLog(null)}>ยกเลิก</button>
-                                  </div>
-                                </div>
-                              ) : (
-                                <div className="log-item">
-                                  <div style={{ flex: 1 }}>
-                                    <div className="log-name">{l.product_name}</div>
-                                    <div className="log-meta">{new Date(l.created_at).toLocaleDateString('th-TH', { day: '2-digit', month: '2-digit', year: '2-digit' })}</div>
-                                    <div className="log-qty">
-                                      {l.quantity} {l.unit}
-                                      {l.mfg_date ? <span style={{ color: 'var(--accent)', fontWeight: 600, marginLeft: 6 }}>MFG {formatMfgDate(l.mfg_date)}</span> : ''}
-                                      {l.note ? ` · ${l.note}` : ''}
-                                    </div>
-                                  </div>
-                                  <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexShrink: 0 }}>
-                                    {l.pallet_image_url && (
-                                      <img src={l.pallet_image_url} alt="pallet" className="pallet-thumb" onClick={() => window.open(l.pallet_image_url!, '_blank')} />
-                                    )}
-                                    <button className="btn btn-ghost btn-sm" onClick={() => setEditingLog(l)}>✏️</button>
-                                    <button className="btn btn-danger btn-sm" onClick={() => handleDeleteLog(l.id)}>🗑</button>
-                                  </div>
-                                </div>
+                      const sessionGroups: Record<string, ScanLog[]> = {}
+                      logs.forEach(l => {
+                        const key = l.session_label || '(ไม่มีหัวข้อ)'
+                        if (!sessionGroups[key]) sessionGroups[key] = []
+                        sessionGroups[key].push(l)
+                      })
+                      return Object.entries(sessionGroups).map(([label, items]) => {
+                        const caseGroups: Record<string, ScanLog[]> = {}
+                        items.forEach(l => {
+                          const ckey = l.case_number != null && l.total_cases != null
+                            ? `${l.case_number}/${l.total_cases}`
+                            : '—'
+                          if (!caseGroups[ckey]) caseGroups[ckey] = []
+                          caseGroups[ckey].push(l)
+                        })
+                        return (
+                          <div key={label}>
+                            <div className="group-header">
+                              📋 {label} · {items.length} รายการ
+                              {items[0]?.pallet_image_url && (
+                                <img src={items[0].pallet_image_url} alt="pallet" style={{ display: 'inline-block', verticalAlign: 'middle', marginLeft: 8, width: 28, height: 28, borderRadius: 6, objectFit: 'cover', border: '1px solid rgba(52,211,153,0.3)', cursor: 'pointer' }} onClick={() => window.open(items[0].pallet_image_url!, '_blank')} />
                               )}
                             </div>
-                          ))}
-                        </div>
-                      ))
+                            {Object.entries(caseGroups).map(([caseKey, caseLogs]) => (
+                              <div key={caseKey}>
+                                <div className="case-group-header">
+                                  📦 ลังที่ {caseKey} · {caseLogs.length} รายการ
+                                </div>
+                                {caseLogs.map(l => (
+                                  <div key={l.id}>
+                                    {editingLog?.id === l.id ? (
+                                      <div className="edit-form">
+                                        <p className="edit-title">{l.product_name}</p>
+                                        <div className="qty-row">
+                                          <input type="number" className="qty-input" style={{ fontSize: 16 }} value={editingLog.quantity} onChange={e => setEditingLog(ev => ev ? { ...ev, quantity: parseInt(e.target.value) || 1 } : ev)} />
+                                        </div>
+                                        <div className="unit-group">
+                                          {unitOptions.map(u => (
+                                            <button key={u} className={`unit-btn ${editingLog.unit === u ? 'active' : ''}`} onClick={() => setEditingLog(ev => ev ? { ...ev, unit: u } : ev)}>{u}</button>
+                                          ))}
+                                        </div>
+                                        <input type="text" className="inp-bare" placeholder="หมายเหตุ" value={editingLog.note} onChange={e => setEditingLog(ev => ev ? { ...ev, note: e.target.value } : ev)} />
+                                        <div style={{ display: 'flex', gap: 8 }}>
+                                          <button className="btn btn-primary btn-md" style={{ flex: 1 }} onClick={handleUpdateLog}>บันทึก</button>
+                                          <button className="btn btn-ghost btn-md" style={{ flex: 1 }} onClick={() => setEditingLog(null)}>ยกเลิก</button>
+                                        </div>
+                                      </div>
+                                    ) : (
+                                      <div className="log-item">
+                                        <div style={{ flex: 1 }}>
+                                          <div className="log-name">{l.product_name}</div>
+                                          <div className="log-meta">{new Date(l.created_at).toLocaleDateString('th-TH', { day: '2-digit', month: '2-digit', year: '2-digit' })}</div>
+                                          <div className="log-qty">
+                                            {l.quantity} {l.unit}
+                                            {l.mfg_date ? <span style={{ color: '#10b981', fontWeight: 600, marginLeft: 6 }}>MFG {l.mfg_date}</span> : ''}
+                                            {l.exp_date ? <span style={{ color: '#f59e0b', fontWeight: 600, marginLeft: 6 }}>EXP {l.exp_date}</span> : ''}
+                                            {l.note ? ` · ${l.note}` : ''}
+                                          </div>
+                                        </div>
+                                        <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexShrink: 0 }}>
+                                          {l.pallet_image_url && (
+                                            <img src={l.pallet_image_url} alt="pallet" className="pallet-thumb" onClick={() => window.open(l.pallet_image_url!, '_blank')} />
+                                          )}
+                                          <button className="btn btn-ghost btn-sm" onClick={() => setEditingLog(l)}>✏️</button>
+                                          <button className="btn btn-danger btn-sm" onClick={() => handleDeleteLog(l.id)}>🗑</button>
+                                        </div>
+                                      </div>
+                                    )}
+                                  </div>
+                                ))}
+                              </div>
+                            ))}
+                          </div>
+                        )
+                      })
                     })()}
                   </div>
                 )}
