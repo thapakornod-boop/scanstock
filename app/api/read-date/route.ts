@@ -56,7 +56,9 @@ export async function POST(request: Request) {
   }
 
   const data = await res.json()
-  const text: string | undefined = data?.candidates?.[0]?.content?.parts?.[0]?.text
+  // รวมข้อความทุก part (ข้าม part ที่เป็นความคิดของโมเดล)
+  const parts: { text?: string; thought?: boolean }[] = data?.candidates?.[0]?.content?.parts ?? []
+  const text = parts.filter(p => !p.thought && p.text).map(p => p.text).join('')
   let parsed: { mfg?: unknown; exp?: unknown; raw?: unknown } = {}
   try { parsed = JSON.parse(text ?? '{}') } catch {}
 
