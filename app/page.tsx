@@ -67,7 +67,7 @@ export default function LoginPage() {
 
         body {
           font-family: 'Sarabun', sans-serif;
-          background: #080b12;
+          background: #3e8ef0;
           overflow: hidden;
         }
 
@@ -77,7 +77,7 @@ export default function LoginPage() {
           display: flex;
           align-items: center;
           justify-content: center;
-          background: #080b12;
+          background: linear-gradient(160deg, #4a9af5 0%, #2b6fd6 100%);
           overflow-y: auto;
           padding: 20px 16px;
         }
@@ -88,8 +88,8 @@ export default function LoginPage() {
           position: fixed;
           inset: 0;
           background-image:
-            linear-gradient(rgba(56,189,248,0.04) 1px, transparent 1px),
-            linear-gradient(90deg, rgba(56,189,248,0.04) 1px, transparent 1px);
+            linear-gradient(rgba(255,255,255,0.07) 1px, transparent 1px),
+            linear-gradient(90deg, rgba(255,255,255,0.07) 1px, transparent 1px);
           background-size: 48px 48px;
           pointer-events: none;
           z-index: 0;
@@ -105,12 +105,12 @@ export default function LoginPage() {
         }
         .orb-1 {
           width: 420px; height: 420px;
-          background: radial-gradient(circle, rgba(14,165,233,0.18) 0%, transparent 70%);
+          background: radial-gradient(circle, rgba(255,255,255,0.22) 0%, transparent 70%);
           top: -120px; left: -100px;
         }
         .orb-2 {
           width: 300px; height: 300px;
-          background: radial-gradient(circle, rgba(99,102,241,0.14) 0%, transparent 70%);
+          background: radial-gradient(circle, rgba(255,255,255,0.16) 0%, transparent 70%);
           bottom: -80px; right: -60px;
         }
 
@@ -120,14 +120,12 @@ export default function LoginPage() {
           z-index: 1;
           width: 100%;
           max-width: 400px;
-          background: rgba(15, 20, 35, 0.9);
-          border: 1px solid rgba(56,189,248,0.12);
+          background: #ffffff;
+          border: 1px solid rgba(255,255,255,0.6);
           border-radius: 24px;
           padding: 36px 32px 32px;
           box-shadow:
-            0 0 0 1px rgba(255,255,255,0.03),
-            0 24px 64px rgba(0,0,0,0.6),
-            0 0 80px rgba(14,165,233,0.06);
+            0 24px 64px rgba(16,57,120,0.35);
           backdrop-filter: blur(20px);
           -webkit-backdrop-filter: blur(20px);
         }
@@ -144,20 +142,20 @@ export default function LoginPage() {
           display: inline-flex;
           align-items: center;
           gap: 6px;
-          background: rgba(14,165,233,0.08);
-          border: 1px solid rgba(14,165,233,0.2);
+          background: rgba(62,142,240,0.08);
+          border: 1px solid rgba(62,142,240,0.25);
           border-radius: 20px;
           padding: 4px 12px;
           font-size: 11px;
           font-family: 'IBM Plex Mono', monospace;
-          color: #38bdf8;
+          color: #2b6fd6;
           letter-spacing: 0.05em;
           margin-top: 4px;
         }
         .dot {
           width: 6px; height: 6px;
           border-radius: 50%;
-          background: #38bdf8;
+          background: #3e8ef0;
           animation: blink 2s ease-in-out infinite;
         }
         @keyframes blink {
@@ -170,13 +168,13 @@ export default function LoginPage() {
         .heading h1 {
           font-size: 22px;
           font-weight: 700;
-          color: #f1f5f9;
+          color: #0f172a;
           letter-spacing: -0.02em;
           line-height: 1.2;
         }
         .heading p {
           font-size: 13px;
-          color: #475569;
+          color: #64748b;
           margin-top: 4px;
         }
 
@@ -186,7 +184,7 @@ export default function LoginPage() {
           display: block;
           font-size: 11px;
           font-weight: 600;
-          color: #64748b;
+          color: #475569;
           font-family: 'IBM Plex Mono', monospace;
           letter-spacing: 0.08em;
           text-transform: uppercase;
@@ -196,15 +194,15 @@ export default function LoginPage() {
           display: flex;
           align-items: center;
           gap: 10px;
-          background: rgba(255,255,255,0.03);
-          border: 1px solid rgba(255,255,255,0.08);
+          background: #f6f9fe;
+          border: 1px solid #dbe5f3;
           border-radius: 14px;
           padding: 0 14px;
           transition: border-color 0.2s, box-shadow 0.2s;
         }
         .input-wrap:focus-within {
-          border-color: rgba(56,189,248,0.5);
-          box-shadow: 0 0 0 3px rgba(56,189,248,0.08);
+          border-color: #3e8ef0;
+          box-shadow: 0 0 0 3px rgba(62,142,240,0.15);
         }
         .input-icon {
           font-size: 15px;
@@ -216,31 +214,31 @@ export default function LoginPage() {
           background: transparent;
           border: none;
           outline: none;
-          color: #e2e8f0;
+          color: #0f172a;
           font-size: 16px;
           font-family: 'IBM Plex Mono', monospace;
           padding: 13px 0;
           width: 100%;
           min-width: 0;
         }
-        .inp::placeholder { color: #334155; font-size: 14px; }
+        .inp::placeholder { color: #94a3b8; font-size: 14px; }
         .inp:-webkit-autofill {
-          -webkit-box-shadow: 0 0 0 100px rgba(15,20,35,0.9) inset;
-          -webkit-text-fill-color: #e2e8f0;
+          -webkit-box-shadow: 0 0 0 100px #f6f9fe inset;
+          -webkit-text-fill-color: #0f172a;
         }
 
         .eye-btn {
           background: none;
           border: none;
           cursor: pointer;
-          color: #334155;
+          color: #94a3b8;
           padding: 4px;
           flex-shrink: 0;
           transition: color 0.15s;
           display: flex;
           align-items: center;
         }
-        .eye-btn:hover { color: #64748b; }
+        .eye-btn:hover { color: #475569; }
 
         /* Error */
         .error-box {
@@ -253,7 +251,7 @@ export default function LoginPage() {
           padding: 10px 14px;
           margin-bottom: 16px;
           font-size: 13px;
-          color: #f87171;
+          color: #dc2626;
           line-height: 1.4;
         }
 
@@ -265,7 +263,7 @@ export default function LoginPage() {
           font-weight: 700;
           font-family: 'Sarabun', sans-serif;
           color: #fff;
-          background: linear-gradient(135deg, #0ea5e9 0%, #2563eb 100%);
+          background: linear-gradient(135deg, #4a9af5 0%, #2b6fd6 100%);
           border: none;
           border-radius: 14px;
           cursor: pointer;
@@ -274,7 +272,7 @@ export default function LoginPage() {
           align-items: center;
           justify-content: center;
           gap: 8px;
-          box-shadow: 0 4px 20px rgba(14,165,233,0.25);
+          box-shadow: 0 4px 20px rgba(62,142,240,0.35);
           margin-top: 6px;
           -webkit-tap-highlight-color: transparent;
         }
@@ -302,11 +300,11 @@ export default function LoginPage() {
         .divider {
           flex: 1;
           height: 1px;
-          background: rgba(255,255,255,0.05);
+          background: #e6edf7;
         }
         .footer-text {
           font-size: 11px;
-          color: #1e293b;
+          color: #94a3b8;
           font-family: 'IBM Plex Mono', monospace;
           white-space: nowrap;
         }
@@ -331,7 +329,7 @@ export default function LoginPage() {
               width={100}
               height={40}
               unoptimized
-              style={{ objectFit: 'contain', filter: 'brightness(1.3)' }}
+              style={{ objectFit: 'contain' }}
             />
             <span className="logo-badge">
               <span className="dot" />

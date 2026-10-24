@@ -7,7 +7,7 @@ import { useRouter } from 'next/navigation'
 import Image from 'next/image'
 
 type BarcodeType = 'piece' | 'case' | 'pack'
-type TabType = 'scan' | 'history' | 'manage'
+type TabType = 'scan' | 'expiry' | 'history' | 'manage'
 type Theme = 'dark' | 'light'
 
 type PriceItem = {
@@ -24,6 +24,7 @@ type PriceItem = {
   in_stock_cases: number | null
   in_stock_pieces: number | null
   stock_value: number | null
+  shelf_life_days: number | null
 }
 
 type ScanEntry = {
@@ -52,9 +53,75 @@ type ScanLog = {
   pallet_image_url: string | null
   mfg_date: string | null
   exp_date: string | null
+  mfg_at: string | null
+  exp_at: string | null
   case_number: number | null
   total_cases: number | null
   created_at: string
+}
+
+type ExpiryRow = {
+  item_code: string
+  product_name: string
+  unit: string
+  exp_at: string
+  qty: number
+}
+
+type ExpiryFilter = 'all' | 'expired' | '30' | '90'
+
+// ── Expiry helpers ──
+const EXPIRY_WARN_DAYS = 30
+const EXPIRY_WATCH_DAYS = 90
+
+// 'วว/ดด/ปปปป' (ปี พ.ศ. หรือ ค.ศ.) → 'yyyy-mm-dd' หรือ null ถ้าไม่ใช่วันที่จริง
+function parseThaiDate(s: string | null): string | null {
+  const m = s?.match(/^(\d{2})\/(\d{2})\/(\d{4})$/)
+  if (!m) return null
+  const d = +m[1], mo = +m[2]
+  let y = +m[3]
+  if (y > 2400) y -= 543
+  const dt = new Date(Date.UTC(y, mo - 1, d))
+  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== mo - 1 || dt.getUTCDate() !== d) return null
+  return dt.toISOString().slice(0, 10)
+}
+
+// 'yyyy-mm-dd' → 'วว/ดด/ปปปป' (พ.ศ.)
+function formatThaiDate(iso: string) {
+  const [y, m, d] = iso.split('-')
+  return `${d}/${m}/${+y + 543}`
+}
+
+function addDaysIso(iso: string, days: number) {
+  const dt = new Date(iso + 'T00:00:00Z')
+  dt.setUTCDate(dt.getUTCDate() + days)
+  return dt.toISOString().slice(0, 10)
+}
+
+function daysLeft(iso: string) {
+  const now = new Date()
+  const today = Date.UTC(now.getFullYear(), now.getMonth(), now.getDate())
+  return Math.round((Date.parse(iso + 'T00:00:00Z') - today) / 86400000)
+}
+
+function expiryStatus(days: number) {
+  if (days < 0) return { label: `หมดอายุแล้ว ${-days} วัน`, color: '#ef4444' }
+  if (days === 0) return { label: 'หมดอายุวันนี้', color: '#ef4444' }
+  if (days <= EXPIRY_WARN_DAYS) return { label: `เหลือ ${days} วัน`, color: '#f97316' }
+  if (days <= EXPIRY_WATCH_DAYS) return { label: `เหลือ ${days} วัน`, color: '#ca8a04' }
+  return { label: `เหลือ ${days} วัน`, color: '#10b981' }
+}
+
+function ExpiryBadge({ iso }: { iso: string | null }) {
+  if (!iso) return null
+  const s = expiryStatus(daysLeft(iso))
+  return (
+    <span style={{
+      display: 'inline-block', marginLeft: 6, padding: '1px 8px', borderRadius: 20,
+      fontSize: 11, fontWeight: 700, whiteSpace: 'nowrap',
+      color: s.color, background: s.color + '1a', border: `1px solid ${s.color}55`,
+    }}>{s.label}</span>
+  )
 }
 
 // ── Date Input ──
@@ -153,7 +220,7 @@ export default function ScanPage() {
   const photoCanvasRef = useRef<HTMLCanvasElement>(null)
 
   const [tab, setTab] = useState<TabType>('scan')
-  const [theme, setTheme] = useState<Theme>('dark')
+  const [theme, setTheme] = useState<Theme>('light')
   const [scanning, setScanning] = useState(false)
 
   // ── allCases: เก็บทุกลังทั้งหัวข้อ ──
@@ -197,6 +264,16 @@ export default function ScanPage() {
   const [allLabels, setAllLabels] = useState<string[]>([])
   const [sharing, setSharing] = useState(false)
   const [shareMsg, setShareMsg] = useState('')
+
+  // ── Expiry ──
+  const [expiryRows, setExpiryRows] = useState<ExpiryRow[]>([])
+  const [loadingExpiry, setLoadingExpiry] = useState(false)
+  const [expiryFilter, setExpiryFilter] = useState<ExpiryFilter>('all')
+
+  // ── อ่านวันที่จากรูปฉลาก ──
+  const labelInputRef = useRef<HTMLInputElement>(null)
+  const [readingLabel, setReadingLabel] = useState(false)
+  const [labelMsg, setLabelMsg] = useState('')
 
   const router = useRouter()
   const supabase = createClient()
@@ -355,8 +432,17 @@ export default function ScanPage() {
     if (palletPhotoMode !== 'camera') { stopPhotoCamera() }
   }, [palletPhotoMode, startPhotoCamera, stopPhotoCamera])
 
+  const fetchExpiry = async () => {
+    setLoadingExpiry(true)
+    const { data, error } = await supabase.from('expiry_watch').select('*').order('exp_at').limit(500)
+    if (error) console.error(error)
+    setExpiryRows((data as ExpiryRow[]) || [])
+    setLoadingExpiry(false)
+  }
+
   useEffect(() => {
     if (tab === 'history' || tab === 'manage') fetchLogs()
+    if (tab === 'expiry') fetchExpiry()
     if (tab !== 'scan') { stopCamera(); setScanning(false) }
     if (tab === 'scan' && sessionConfirmed) setScanning(true)
   }, [tab])
@@ -440,7 +526,7 @@ export default function ScanPage() {
   }, [scanning, sessionConfirmed, stopCamera])
 
   const fetchByBarcode = async (barcode: string) => {
-    setNotFound(false); setCurrentEntry(null)
+    setNotFound(false); setCurrentEntry(null); setLabelMsg('')
     const cleaned = barcode.trim().replace(/\s/g, '')
     setLastSearched(cleaned)
     const { data: priceData } = await supabase
@@ -474,6 +560,50 @@ export default function ScanPage() {
     setCurrentEntry({ priceItem: mergedItem, barcodeType, quantity: 1, unit: defaultUnit, note: '', mfgDate: '', expDate: '' })
   }
 
+  // ย่อรูปให้ด้านยาวสุดไม่เกิน 1280px แล้วคืนค่า base64 (jpeg, ไม่มี prefix)
+  const resizeToBase64 = (file: File) => new Promise<string>((resolve, reject) => {
+    const img = new window.Image()
+    const url = URL.createObjectURL(file)
+    img.onload = () => {
+      const scale = Math.min(1, 1280 / Math.max(img.width, img.height))
+      const canvas = document.createElement('canvas')
+      canvas.width = Math.round(img.width * scale)
+      canvas.height = Math.round(img.height * scale)
+      canvas.getContext('2d')?.drawImage(img, 0, 0, canvas.width, canvas.height)
+      URL.revokeObjectURL(url)
+      resolve(canvas.toDataURL('image/jpeg', 0.85).split(',')[1])
+    }
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('อ่านไฟล์รูปไม่ได้')) }
+    img.src = url
+  })
+
+  const handleReadLabel = async (file: File | undefined) => {
+    if (!file) return
+    setReadingLabel(true); setLabelMsg('')
+    try {
+      const image = await resizeToBase64(file)
+      const res = await fetch('/api/read-date', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ image }),
+      })
+      const data: { mfg?: string | null; exp?: string | null; raw?: string | null; error?: string } = await res.json()
+      if (!res.ok) { setLabelMsg(`❌ ${data.error || 'อ่านรูปไม่สำเร็จ'}`); return }
+      if (!data.mfg && !data.exp) { setLabelMsg('⚠️ หาวันที่ในรูปไม่เจอ ลองถ่ายใหม่ให้ชัดขึ้น หรือกรอกเอง'); return }
+      setCurrentEntry(e => e ? {
+        ...e,
+        mfgDate: data.mfg ? formatThaiDate(data.mfg) : e.mfgDate,
+        expDate: data.exp ? formatThaiDate(data.exp) : e.expDate,
+      } : e)
+      setLabelMsg(`✅ อ่านได้: "${data.raw ?? ''}" — ตรวจสอบวันที่ก่อนกดเพิ่ม`)
+    } catch {
+      setLabelMsg('❌ อ่านรูปไม่สำเร็จ')
+    } finally {
+      setReadingLabel(false)
+      if (labelInputRef.current) labelInputRef.current.value = ''
+    }
+  }
+
   const handleManualSearch = async () => {
     const trimmed = manualBarcode.trim().replace(/\s/g, '')
     if (!trimmed) return
@@ -484,7 +614,7 @@ export default function ScanPage() {
 
   // ── เพิ่มสินค้าลงลังปัจจุบัน (ยังไม่ save DB) ──
   const handleAddEntry = () => {
-    if (!currentEntry) return
+    if (!currentEntry || entryHasBadDate) return
     setCurrentEntries(prev => [...prev, currentEntry])
     setCurrentEntry(null); setNotFound(false); setManualBarcode('')
     setTimeout(() => setScanning(true), 300)
@@ -541,6 +671,8 @@ export default function ScanPage() {
           pallet_image_url: palletImageUrl || null,
           mfg_date: e.mfgDate || null,
           exp_date: e.expDate || null,
+          mfg_at: parseThaiDate(e.mfgDate),
+          exp_at: parseThaiDate(e.expDate),
           case_number: caseNum,
           total_cases: totalCases,
         })
@@ -643,6 +775,10 @@ export default function ScanPage() {
     setSharing(false); setTimeout(() => setShareMsg(''), 3000)
   }
 
+  // วันที่ที่พิมพ์ไม่ครบ หรือไม่ใช่วันที่จริง (เช่น 31/02)
+  const isBadDate = (s: string) => s !== '' && !parseThaiDate(s)
+  const entryHasBadDate = !!currentEntry && (isBadDate(currentEntry.mfgDate) || isBadDate(currentEntry.expDate))
+
   const unitOptions = ['ชิ้น', 'ลัง', 'แพ็ค']
   const barcodeBadge = (type: BarcodeType) => ({
     piece: { label: 'บาร์ชิ้น', color: '#0ea5e9' },
@@ -657,25 +793,28 @@ export default function ScanPage() {
     return '#34d399'
   }
 
+  // สีหลักตามโลโก้ RSM (ฟ้า #3E8EF0)
   const darkVars = `
-    --bg:#0a0d14;--bg2:#121623;--bg3:#0a0d14;
-    --border:#1e2235;--border2:#161924;
-    --text:#e2e8f0;--text2:#cbd5e1;--text3:#94a3b8;--text4:#475569;--text5:#334155;
-    --accent:#38bdf8;--accent2:#0ea5e9;
-    --hdr-bg:rgba(16,20,32,0.95);--cam-hint:#475569;--meta-label:#334155;
-    --log-date:#2a3044;--tab-active-bg:rgba(56,189,248,0.04);
-    --edit-bg:#0d1018;
-    --stock-bg:rgba(56,189,248,0.05);--stock-border:rgba(56,189,248,0.12);
+    --bg:#0a1120;--bg2:#111a2e;--bg3:#0c1424;
+    --border:#1d2a44;--border2:#16203a;
+    --text:#e2e8f0;--text2:#cbd5e1;--text3:#94a3b8;--text4:#64748b;--text5:#475569;
+    --accent:#5aa2f5;--accent2:#3e8ef0;
+    --accent-soft:rgba(90,162,245,0.08);--accent-line:rgba(90,162,245,0.22);
+    --hdr-bg:rgba(13,20,36,0.95);--cam-hint:#64748b;--meta-label:#475569;
+    --log-date:#3b4a66;--tab-active-bg:rgba(90,162,245,0.07);
+    --edit-bg:#0d1526;
+    --stock-bg:rgba(90,162,245,0.06);--stock-border:rgba(90,162,245,0.16);
   `
   const lightVars = `
-    --bg:#f1f5f9;--bg2:#ffffff;--bg3:#f8fafc;
-    --border:#e2e8f0;--border2:#e8ecf0;
+    --bg:#eef4fd;--bg2:#ffffff;--bg3:#f6f9fe;
+    --border:#dbe5f3;--border2:#e6edf7;
     --text:#0f172a;--text2:#1e293b;--text3:#475569;--text4:#64748b;--text5:#94a3b8;
-    --accent:#0284c7;--accent2:#0369a1;
-    --hdr-bg:rgba(255,255,255,0.95);--cam-hint:#64748b;--meta-label:#94a3b8;
-    --log-date:#94a3b8;--tab-active-bg:rgba(2,132,199,0.06);
-    --edit-bg:#f8fafc;
-    --stock-bg:rgba(2,132,199,0.04);--stock-border:rgba(2,132,199,0.14);
+    --accent:#3e8ef0;--accent2:#2b6fd6;
+    --accent-soft:rgba(62,142,240,0.07);--accent-line:rgba(62,142,240,0.25);
+    --hdr-bg:rgba(255,255,255,0.96);--cam-hint:#64748b;--meta-label:#94a3b8;
+    --log-date:#94a3b8;--tab-active-bg:rgba(62,142,240,0.07);
+    --edit-bg:#f6f9fe;
+    --stock-bg:rgba(62,142,240,0.05);--stock-border:rgba(62,142,240,0.18);
   `
 
   // ── Stock Panel ──
@@ -805,6 +944,7 @@ export default function ScanPage() {
                     {e.quantity} {e.unit}
                     {e.mfgDate ? ` · MFG ${e.mfgDate}` : ''}
                     {e.expDate ? ` · EXP ${e.expDate}` : ''}
+                    <ExpiryBadge iso={parseThaiDate(e.expDate)} />
                     {e.note ? ` · ${e.note}` : ''}
                   </div>
                 </div>
@@ -863,7 +1003,7 @@ export default function ScanPage() {
 
         .scan-root{min-height:100dvh;width:100%;background:var(--bg);${isDark?darkVars:lightVars}}
 
-        .hdr{background:var(--hdr-bg);border-bottom:1px solid var(--border);padding:11px 18px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);}
+        .hdr{background:var(--hdr-bg);border-top:3px solid var(--accent2);border-bottom:1px solid var(--border);padding:11px 18px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100;backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);}
         .hdr-left{display:flex;align-items:center;gap:12px;}
         .hdr-right{display:flex;align-items:center;gap:8px;}
         .hdr-name{font-size:13px;font-weight:600;color:var(--text2);line-height:1.2;}
@@ -881,11 +1021,14 @@ export default function ScanPage() {
         .card{background:var(--bg2);border:1px solid var(--border);border-radius:16px;overflow:hidden;width:100%;}
         .card-header{padding:13px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:10px;}
         .card-header h2{font-size:14px;font-weight:600;color:var(--text);margin:0;}
-        .card-header.accent{background:${isDark?'linear-gradient(135deg,#0c3a5c 0%,#0f4c75 100%)':'linear-gradient(135deg,#e0f2fe 0%,#bae6fd 100%)'};border-bottom-color:${isDark?'rgba(56,189,248,0.15)':'rgba(2,132,199,0.15)'};}
+        .card-header.accent{background:linear-gradient(135deg,#4a9af5 0%,#2b6fd6 100%);border-bottom-color:transparent;}
+        .card-header.accent h2{color:#fff;}
+        .card-header.accent .badge{color:#fff!important;border-color:rgba(255,255,255,0.45)!important;background:rgba(255,255,255,0.16)!important;}
+        .card-header.accent .btn-ghost{color:#fff;background:rgba(255,255,255,0.16);border-color:rgba(255,255,255,0.35);}
         .card-body{padding:16px;}
 
         .session-prompt{display:flex;flex-direction:column;gap:14px;padding:20px 16px;}
-        .session-current{display:flex;align-items:center;gap:8px;background:${isDark?'rgba(56,189,248,0.08)':'rgba(2,132,199,0.06)'};border:1px solid ${isDark?'rgba(56,189,248,0.2)':'rgba(2,132,199,0.2)'};border-radius:10px;padding:10px 14px;}
+        .session-current{display:flex;align-items:center;gap:8px;background:var(--accent-soft);border:1px solid var(--accent-line);border-radius:10px;padding:10px 14px;}
         .session-current span{font-size:13px;color:var(--accent);font-weight:600;}
 
         .camera-wrap{position:relative;background:#000;aspect-ratio:4/3;overflow:hidden;}
@@ -908,7 +1051,7 @@ export default function ScanPage() {
         .input-icon-abs{position:absolute;left:11px;top:50%;transform:translateY(-50%);font-size:14px;pointer-events:none;opacity:0.6;}
 
         .inp{width:100%;background:var(--bg3);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:16px;font-family:'Sarabun',sans-serif;padding:10px 12px 10px 34px;outline:none;transition:border-color 0.15s,box-shadow 0.15s;}
-        .inp:focus{border-color:var(--accent);box-shadow:0 0 0 3px ${isDark?'rgba(56,189,248,0.08)':'rgba(2,132,199,0.08)'};}
+        .inp:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft);}
         .inp::placeholder{color:var(--text5);}
         .inp-bare{background:var(--bg3);border:1px solid var(--border);border-radius:10px;color:var(--text);font-size:16px;font-family:'Sarabun',sans-serif;padding:10px 12px;outline:none;transition:border-color 0.15s;width:100%;}
         .inp-bare:focus{border-color:var(--accent);}
@@ -935,7 +1078,7 @@ export default function ScanPage() {
         .share-msg{border-radius:10px;padding:10px 14px;font-size:13px;font-weight:500;text-align:center;margin-top:4px;}
         .share-msg.ok{background:rgba(6,199,85,0.1);border:1px solid rgba(6,199,85,0.25);color:#06C755;}
         .share-msg.err{background:rgba(248,113,113,0.08);border:1px solid rgba(248,113,113,0.2);color:#f87171;}
-        .share-msg.info{background:${isDark?'rgba(56,189,248,0.08)':'rgba(2,132,199,0.06)'};border:1px solid ${isDark?'rgba(56,189,248,0.2)':'rgba(2,132,199,0.2)'};color:var(--accent);}
+        .share-msg.info{background:var(--accent-soft);border:1px solid var(--accent-line);color:var(--accent);}
         .share-tip{background:${isDark?'rgba(6,199,85,0.06)':'rgba(6,199,85,0.05)'};border:1px solid rgba(6,199,85,0.18);border-radius:10px;padding:10px 14px;font-size:12px;color:${isDark?'#4ade80':'#16a34a'};line-height:1.6;}
 
         .qty-row{display:flex;align-items:center;gap:8px;}
@@ -985,9 +1128,14 @@ export default function ScanPage() {
 
         .section-label{font-size:11px;font-weight:600;color:var(--text4);letter-spacing:0.08em;text-transform:uppercase;font-family:'IBM Plex Mono',monospace;padding:2px 0 6px;}
 
-        .group-header{padding:8px 16px;font-size:11px;font-weight:700;color:var(--accent);letter-spacing:0.06em;text-transform:uppercase;font-family:'IBM Plex Mono',monospace;background:${isDark?'rgba(56,189,248,0.05)':'rgba(2,132,199,0.04)'};border-bottom:1px solid var(--border2);border-top:1px solid var(--border2);}
+        .group-header{padding:8px 16px;font-size:11px;font-weight:700;color:var(--accent);letter-spacing:0.06em;text-transform:uppercase;font-family:'IBM Plex Mono',monospace;background:var(--accent-soft);border-bottom:1px solid var(--border2);border-top:1px solid var(--border2);}
         .group-header:first-child{border-top:none;}
         .case-group-header{padding:7px 16px;font-size:11px;font-weight:700;color:#f59e0b;letter-spacing:0.06em;font-family:'IBM Plex Mono',monospace;background:${isDark?'rgba(245,158,11,0.05)':'rgba(245,158,11,0.04)'};border-bottom:1px solid var(--border2);border-top:1px solid var(--border2);display:flex;align-items:center;gap:8px;}
+
+        .date-warn{font-size:12px;font-weight:600;color:#ef4444;background:rgba(239,68,68,0.08);border:1px solid rgba(239,68,68,0.22);border-radius:8px;padding:6px 10px;}
+        .exp-suggest{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:13px;color:var(--text2);background:var(--accent-soft);border:1px solid var(--accent-line);border-radius:10px;padding:8px 12px;}
+        .exp-suggest small{color:var(--text4);}
+        .label-msg{margin-top:8px;font-size:13px;color:var(--text2);background:var(--accent-soft);border:1px solid var(--accent-line);border-radius:10px;padding:8px 12px;line-height:1.5;}
 
         .pallet-thumb{width:48px;height:48px;border-radius:8px;object-fit:cover;border:1px solid var(--border);flex-shrink:0;cursor:pointer;}
 
@@ -1048,7 +1196,7 @@ export default function ScanPage() {
 
         {/* ── Tabs ── */}
         <div className="tabs">
-          {[{ key: 'scan', label: '📷 สแกน' }, { key: 'history', label: '📋 ประวัติฉัน' }, { key: 'manage', label: '⚙️ จัดการ' }].map(t => (
+          {[{ key: 'scan', label: '📷 สแกน' }, { key: 'expiry', label: '⏰ หมดอายุ' }, { key: 'history', label: '📋 ประวัติ' }, { key: 'manage', label: '⚙️ จัดการ' }].map(t => (
             <button key={t.key} className={`tab-btn ${tab === t.key ? 'active' : ''}`}
               onClick={() => setTab(t.key as TabType)}>{t.label}</button>
           ))}
@@ -1270,6 +1418,17 @@ export default function ScanPage() {
                               </div>
                             </div>
                             <div>
+                              <input ref={labelInputRef} type="file" accept="image/*" capture="environment"
+                                style={{ display: 'none' }}
+                                onChange={ev => handleReadLabel(ev.target.files?.[0])} />
+                              <button className="btn btn-primary btn-md" style={{ width: '100%' }}
+                                disabled={readingLabel}
+                                onClick={() => labelInputRef.current?.click()}>
+                                {readingLabel ? '⏳ กำลังอ่านวันที่...' : '📷 ถ่ายรูปฉลาก อ่านวันผลิต/หมดอายุอัตโนมัติ'}
+                              </button>
+                              {labelMsg && <div className="label-msg">{labelMsg}</div>}
+                            </div>
+                            <div>
                               <div className="section-label">วันผลิต / MFG Date</div>
                               <DateInputField
                                 value={currentEntry.mfgDate}
@@ -1286,12 +1445,46 @@ export default function ScanPage() {
                                 placeholder="วว/ดด/ปปปป เช่น 01/06/2570"
                                 icon="⏰"
                               />
+                              {(() => {
+                                const mfgIso = parseThaiDate(currentEntry.mfgDate)
+                                const expIso = parseThaiDate(currentEntry.expDate)
+                                const shelf = currentEntry.priceItem.shelf_life_days
+                                const suggestedExp = mfgIso && !currentEntry.expDate && shelf ? addDaysIso(mfgIso, shelf) : null
+                                return (
+                                  <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 6 }}>
+                                    {(isBadDate(currentEntry.mfgDate) || isBadDate(currentEntry.expDate)) && (
+                                      <div className="date-warn">⚠️ วันที่ยังไม่ครบหรือไม่ถูกต้อง (ต้องเป็น วว/ดด/ปปปป)</div>
+                                    )}
+                                    {mfgIso && expIso && expIso < mfgIso && (
+                                      <div className="date-warn">⚠️ วันหมดอายุมาก่อนวันผลิต — ตรวจสอบอีกครั้ง</div>
+                                    )}
+                                    {expIso && (
+                                      <div style={{ fontSize: 13, color: 'var(--text3)' }}>
+                                        สถานะ:<ExpiryBadge iso={expIso} />
+                                      </div>
+                                    )}
+                                    {suggestedExp && (
+                                      <div className="exp-suggest">
+                                        <span>
+                                          คาดว่าหมดอายุ <strong>{formatThaiDate(suggestedExp)}</strong>
+                                          <ExpiryBadge iso={suggestedExp} />
+                                          <br /><small>คำนวณจากอายุสินค้า {shelf} วัน</small>
+                                        </span>
+                                        <button className="btn btn-primary btn-sm"
+                                          onClick={() => setCurrentEntry(e => e ? { ...e, expDate: formatThaiDate(suggestedExp) } : e)}>
+                                          ใช้วันนี้
+                                        </button>
+                                      </div>
+                                    )}
+                                  </div>
+                                )
+                              })()}
                             </div>
                             <input type="text" className="inp-bare"
                               placeholder="หมายเหตุ (ถ้ามี)"
                               value={currentEntry.note}
                               onChange={ev => setCurrentEntry(e => e ? { ...e, note: ev.target.value } : e)} />
-                            <button className="btn btn-success btn-lg" onClick={handleAddEntry}>
+                            <button className="btn btn-success btn-lg" onClick={handleAddEntry} disabled={entryHasBadDate}>
                               ➕ เพิ่มในลังที่ {currentCaseNumber}
                             </button>
                             <button className="btn btn-ghost btn-md"
@@ -1320,6 +1513,7 @@ export default function ScanPage() {
                                     {e.quantity} {e.unit}
                                     {e.mfgDate ? ` · MFG ${e.mfgDate}` : ''}
                                     {e.expDate ? ` · EXP ${e.expDate}` : ''}
+                                    <ExpiryBadge iso={parseThaiDate(e.expDate)} />
                                     {e.note ? ` · ${e.note}` : ''}
                                   </div>
                                 </div>
@@ -1374,6 +1568,61 @@ export default function ScanPage() {
             </>
           )}
 
+          {/* ══════════ TAB: EXPIRY ══════════ */}
+          {tab === 'expiry' && (() => {
+            const rows = expiryRows.map(r => ({ ...r, days: daysLeft(r.exp_at) }))
+            const inFilter = (d: number, f: ExpiryFilter) =>
+              f === 'all' ? true
+              : f === 'expired' ? d < 0
+              : f === '30' ? d >= 0 && d <= EXPIRY_WARN_DAYS
+              : d >= 0 && d <= EXPIRY_WATCH_DAYS
+            const filters: { key: ExpiryFilter; label: string }[] = [
+              { key: 'all', label: 'ทั้งหมด' },
+              { key: 'expired', label: 'หมดแล้ว' },
+              { key: '30', label: `≤ ${EXPIRY_WARN_DAYS} วัน` },
+              { key: '90', label: `≤ ${EXPIRY_WATCH_DAYS} วัน` },
+            ]
+            const shown = rows.filter(r => inFilter(r.days, expiryFilter))
+            return (
+              <div className="card">
+                <div className="card-header accent">
+                  <h2>⏰ สินค้าใกล้หมดอายุ (ทุกคน)</h2>
+                  <button className="btn btn-ghost btn-sm" onClick={fetchExpiry} disabled={loadingExpiry}>🔄</button>
+                </div>
+                <div style={{ padding: '12px 14px', borderBottom: '1px solid var(--border)' }}>
+                  <div className="unit-group">
+                    {filters.map(f => (
+                      <button key={f.key} className={`unit-btn ${expiryFilter === f.key ? 'active' : ''}`}
+                        onClick={() => setExpiryFilter(f.key)}>
+                        {f.label} ({rows.filter(r => inFilter(r.days, f.key)).length})
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                {loadingExpiry ? (
+                  <p style={{ textAlign: 'center', color: 'var(--text5)', padding: '32px 0', fontSize: 14 }}>กำลังโหลด...</p>
+                ) : shown.length === 0 ? (
+                  <p style={{ textAlign: 'center', color: 'var(--text5)', padding: '32px 0', fontSize: 14 }}>ไม่มีรายการ</p>
+                ) : (
+                  <div className="scroll-area">
+                    {shown.map(r => (
+                      <div key={`${r.item_code}|${r.unit}|${r.exp_at}`} className="log-item">
+                        <div style={{ flex: 1 }}>
+                          <div className="log-name">{r.product_name}</div>
+                          <div className="log-meta">{r.item_code} · {r.qty} {r.unit}</div>
+                          <div className="log-qty">
+                            EXP {formatThaiDate(r.exp_at)}
+                            <ExpiryBadge iso={r.exp_at} />
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )
+          })()}
+
           {/* ══════════ TAB: HISTORY ══════════ */}
           {tab === 'history' && (
             <div className="card">
@@ -1426,6 +1675,7 @@ export default function ScanPage() {
                                       {l.quantity} {l.unit}
                                       {l.mfg_date ? <span style={{ color: '#10b981', fontWeight: 600, marginLeft: 6 }}>MFG {l.mfg_date}</span> : ''}
                                       {l.exp_date ? <span style={{ color: '#f59e0b', fontWeight: 600, marginLeft: 6 }}>EXP {l.exp_date}</span> : ''}
+                                      <ExpiryBadge iso={l.exp_at ?? parseThaiDate(l.exp_date)} />
                                       {l.note ? ` · ${l.note}` : ''}
                                     </div>
                                   </div>
@@ -1563,6 +1813,7 @@ export default function ScanPage() {
                                             {l.quantity} {l.unit}
                                             {l.mfg_date ? <span style={{ color: '#10b981', fontWeight: 600, marginLeft: 6 }}>MFG {l.mfg_date}</span> : ''}
                                             {l.exp_date ? <span style={{ color: '#f59e0b', fontWeight: 600, marginLeft: 6 }}>EXP {l.exp_date}</span> : ''}
+                                            <ExpiryBadge iso={l.exp_at ?? parseThaiDate(l.exp_date)} />
                                             {l.note ? ` · ${l.note}` : ''}
                                           </div>
                                         </div>
