@@ -70,6 +70,15 @@ type ExpiryRow = {
 
 type ExpiryFilter = 'all' | 'expired' | '30' | '90'
 
+type SessionGroup = {
+  key: string
+  label: string
+  createdAt: string
+  totalCases: number | null
+  palletUrl: string | null
+  logs: ScanLog[]
+}
+
 // ── Expiry helpers ──
 const EXPIRY_WARN_DAYS = 30
 const EXPIRY_WATCH_DAYS = 90
@@ -264,6 +273,7 @@ export default function ScanPage() {
   const [allLabels, setAllLabels] = useState<string[]>([])
   const [sharing, setSharing] = useState(false)
   const [shareMsg, setShareMsg] = useState('')
+  const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({})
 
   // ── Expiry ──
   const [expiryRows, setExpiryRows] = useState<ExpiryRow[]>([])
@@ -726,11 +736,38 @@ export default function ScanPage() {
     setEditingLog(null); fetchLogs()
   }
 
+  const handleDeleteGroup = async (g: SessionGroup) => {
+    if (!confirm(`ยืนยันลบหัวข้อ "${g.label}" (${g.logs.length} รายการ)?`)) return
+    await supabase.from('scan_logs').delete().in('id', g.logs.map(l => l.id))
+    fetchLogs()
+  }
+
   const getFilteredLogs = () => {
     let filtered = logs
     if (filterLabel) filtered = filtered.filter(l => l.session_label === filterLabel)
     return filtered
   }
+
+  // จัดกลุ่มตามรอบการบันทึก (หัวข้อ + เวลาบันทึก) เรียงใหม่สุดก่อนตามลำดับ logs
+  const buildSessionGroups = (rows: ScanLog[]): SessionGroup[] => {
+    const map = new Map<string, SessionGroup>()
+    rows.forEach(l => {
+      const label = l.session_label || '(ไม่มีหัวข้อ)'
+      const key = `${label}|${l.created_at}`
+      let g = map.get(key)
+      if (!g) {
+        g = { key, label, createdAt: l.created_at, totalCases: l.total_cases, palletUrl: l.pallet_image_url, logs: [] }
+        map.set(key, g)
+      }
+      g.logs.push(l)
+    })
+    return Array.from(map.values())
+  }
+
+  // หัวข้อแรก (ใหม่สุด) เปิดไว้ นอกนั้นหุบ จนกว่าผู้ใช้จะกด
+  const isGroupOpen = (key: string, idx: number) => openGroups[key] ?? idx === 0
+  const setAllGroups = (groups: SessionGroup[], open: boolean) =>
+    setOpenGroups(Object.fromEntries(groups.map(g => [g.key, open])))
 
   const buildCsvBlob = (filtered: ScanLog[]): Blob => {
     const header = 'วันที่,รหัสพนักงาน,ชื่อพนักงาน,หัวข้อ,ลังที่,จำนวนลังทั้งหมด,รหัสสินค้า,ชื่อสินค้า,แบรนด์,ขนาด,จำนวน,หน่วย,วันผลิต,วันหมดอายุ,หมายเหตุ,รูปพาเลท\n'
@@ -991,6 +1028,99 @@ export default function ScanPage() {
     </div>
   )
 
+  // ── รายการแยกตามหัวข้อ แบบกดหุบ/ขยายได้ (ใช้ทั้งแท็บประวัติและจัดการ) ──
+  // เป็นฟังก์ชันธรรมดา ไม่ใช่ component เพื่อไม่ให้ช่องแก้ไขหลุด focus ตอนพิมพ์
+  const renderLogRow = (l: ScanLog, editable: boolean) => {
+    if (editable && editingLog?.id === l.id) {
+      return (
+        <div key={l.id} className="edit-form">
+          <p className="edit-title">{l.product_name}</p>
+          <div className="qty-row">
+            <input type="number" className="qty-input" style={{ fontSize: 16 }}
+              value={editingLog.quantity}
+              onChange={e => setEditingLog(ev => ev ? { ...ev, quantity: parseInt(e.target.value) || 1 } : ev)} />
+          </div>
+          <div className="unit-group">
+            {unitOptions.map(u => (
+              <button key={u} className={`unit-btn ${editingLog.unit === u ? 'active' : ''}`}
+                onClick={() => setEditingLog(ev => ev ? { ...ev, unit: u } : ev)}>{u}</button>
+            ))}
+          </div>
+          <input type="text" className="inp-bare" placeholder="หมายเหตุ"
+            value={editingLog.note}
+            onChange={e => setEditingLog(ev => ev ? { ...ev, note: e.target.value } : ev)} />
+          <div style={{ display: 'flex', gap: 8 }}>
+            <button className="btn btn-primary btn-md" style={{ flex: 1 }} onClick={handleUpdateLog}>บันทึก</button>
+            <button className="btn btn-ghost btn-md" style={{ flex: 1 }} onClick={() => setEditingLog(null)}>ยกเลิก</button>
+          </div>
+        </div>
+      )
+    }
+    return (
+      <div key={l.id} className="log-item">
+        <div style={{ flex: 1 }}>
+          <div className="log-name">{l.product_name}</div>
+          <div className="log-meta">{l.item_code} · {l.brand} · {l.size}</div>
+          <div className="log-qty">
+            {l.quantity} {l.unit}
+            {l.mfg_date ? <span style={{ color: '#10b981', fontWeight: 600, marginLeft: 6 }}>MFG {l.mfg_date}</span> : ''}
+            {l.exp_date ? <span style={{ color: '#f59e0b', fontWeight: 600, marginLeft: 6 }}>EXP {l.exp_date}</span> : ''}
+            <ExpiryBadge iso={l.exp_at ?? parseThaiDate(l.exp_date)} />
+            {l.note ? ` · ${l.note}` : ''}
+          </div>
+        </div>
+        {editable && (
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexShrink: 0 }}>
+            <button className="btn btn-ghost btn-sm" onClick={() => setEditingLog(l)}>✏️</button>
+            <button className="btn btn-danger btn-sm" onClick={() => handleDeleteLog(l.id)}>🗑</button>
+          </div>
+        )}
+      </div>
+    )
+  }
+
+  const renderSessionGroups = (groups: SessionGroup[], editable: boolean) => {
+    if (loadingLogs) return <p className="empty-msg">กำลังโหลด...</p>
+    if (groups.length === 0) return <p className="empty-msg">ยังไม่มีข้อมูล</p>
+    return groups.map((g, idx) => {
+      const open = isGroupOpen(g.key, idx)
+      const cases = new Map<number | null, ScanLog[]>()
+      g.logs.forEach(l => cases.set(l.case_number, [...(cases.get(l.case_number) ?? []), l]))
+      const sortedCases = Array.from(cases.entries()).sort(([a], [b]) => (a ?? 0) - (b ?? 0))
+      const totalQty = g.logs.reduce((s, l) => s + l.quantity, 0)
+      return (
+        <div key={g.key} className={`session-block ${open ? 'open' : ''}`}>
+          <div className="session-head" role="button" tabIndex={0}
+            onClick={() => setOpenGroups(s => ({ ...s, [g.key]: !open }))}
+            onKeyDown={e => { if (e.key === 'Enter') setOpenGroups(s => ({ ...s, [g.key]: !open })) }}>
+            <span className="chev">{open ? '▾' : '▸'}</span>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div className="session-title">{g.label}</div>
+              <div className="session-sub">
+                {new Date(g.createdAt).toLocaleString('th-TH', { day: '2-digit', month: 'short', year: '2-digit', hour: '2-digit', minute: '2-digit' })}
+                {' · '}{g.logs.length} รายการ · รวม {totalQty}{g.totalCases ? ` · ${g.totalCases} ลัง` : ''}
+              </div>
+            </div>
+            {g.palletUrl && (
+              <img src={g.palletUrl} alt="pallet" className="pallet-thumb" style={{ width: 36, height: 36 }}
+                onClick={e => { e.stopPropagation(); window.open(g.palletUrl!, '_blank') }} />
+            )}
+            {editable && (
+              <button className="btn btn-danger btn-sm"
+                onClick={e => { e.stopPropagation(); handleDeleteGroup(g) }}>🗑</button>
+            )}
+          </div>
+          {open && sortedCases.map(([caseNum, caseLogs]) => (
+            <div key={caseNum ?? 'none'}>
+              <div className="case-group-header">📦 {caseNum != null ? `ลังที่ ${caseNum}` : '—'} · {caseLogs.length} รายการ</div>
+              {caseLogs.map(l => renderLogRow(l, editable))}
+            </div>
+          ))}
+        </div>
+      )
+    })
+  }
+
   return (
     <>
       <style>{`
@@ -1136,6 +1266,17 @@ export default function ScanPage() {
         .exp-suggest{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:13px;color:var(--text2);background:var(--accent-soft);border:1px solid var(--accent-line);border-radius:10px;padding:8px 12px;}
         .exp-suggest small{color:var(--text4);}
         .label-msg{margin-top:8px;font-size:13px;color:var(--text2);background:var(--accent-soft);border:1px solid var(--accent-line);border-radius:10px;padding:8px 12px;line-height:1.5;}
+
+        .session-block{border-bottom:1px solid var(--border);}
+        .session-block:last-child{border-bottom:none;}
+        .session-head{display:flex;align-items:center;gap:10px;padding:12px 14px;cursor:pointer;background:var(--bg2);transition:background 0.15s;-webkit-tap-highlight-color:transparent;}
+        .session-head:hover{background:var(--accent-soft);}
+        .session-block.open .session-head{background:var(--accent-soft);border-bottom:1px solid var(--accent-line);}
+        .chev{font-size:14px;color:var(--accent);width:14px;flex-shrink:0;}
+        .session-title{font-size:15px;font-weight:700;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+        .session-sub{font-size:11px;color:var(--text4);font-family:'IBM Plex Mono',monospace;margin-top:2px;}
+        .group-tools{display:flex;gap:8px;justify-content:flex-end;padding:8px 14px;border-bottom:1px solid var(--border);}
+        .empty-msg{text-align:center;color:var(--text5);padding:32px 0;font-size:14px;}
 
         .pallet-thumb{width:48px;height:48px;border-radius:8px;object-fit:cover;border:1px solid var(--border);flex-shrink:0;cursor:pointer;}
 
@@ -1624,222 +1765,80 @@ export default function ScanPage() {
           })()}
 
           {/* ══════════ TAB: HISTORY ══════════ */}
-          {tab === 'history' && (
-            <div className="card">
-              <div className="card-header accent">
-                <h2>📋 ประวัติการบันทึกของฉัน</h2>
-                {!loadingLogs && logs.length > 0 && (
-                  <span className="badge" style={{ color: '#7dd3fc', borderColor: '#0c4a6e', background: '#0c4a6e55' }}>{logs.length}</span>
-                )}
-              </div>
-              {loadingLogs ? (
-                <p style={{ textAlign: 'center', color: 'var(--text5)', padding: '32px 0', fontSize: 14 }}>กำลังโหลด...</p>
-              ) : logs.length === 0 ? (
-                <p style={{ textAlign: 'center', color: 'var(--text5)', padding: '32px 0', fontSize: 14 }}>ยังไม่มีประวัติ</p>
-              ) : (
-                <div className="scroll-area">
-                  {(() => {
-                    const sessionGroups: Record<string, ScanLog[]> = {}
-                    logs.forEach(l => {
-                      const key = l.session_label || '(ไม่มีหัวข้อ)'
-                      if (!sessionGroups[key]) sessionGroups[key] = []
-                      sessionGroups[key].push(l)
-                    })
-                    return Object.entries(sessionGroups).map(([label, items]) => {
-                      const caseGroups: Record<string, ScanLog[]> = {}
-                      items.forEach(l => {
-                        const ckey = l.case_number != null ? `ลังที่ ${l.case_number}` : '—'
-                        if (!caseGroups[ckey]) caseGroups[ckey] = []
-                        caseGroups[ckey].push(l)
-                      })
-                      return (
-                        <div key={label}>
-                          <div className="group-header">
-                            📋 {label} · {items.length} รายการ
-                            {items[0]?.total_cases ? ` · ${items[0].total_cases} ลัง` : ''}
-                            {items[0]?.pallet_image_url && (
-                              <img src={items[0].pallet_image_url} alt="pallet"
-                                style={{ display: 'inline-block', verticalAlign: 'middle', marginLeft: 8, width: 28, height: 28, borderRadius: 6, objectFit: 'cover', cursor: 'pointer' }}
-                                onClick={() => window.open(items[0].pallet_image_url!, '_blank')} />
-                            )}
-                          </div>
-                          {Object.entries(caseGroups).map(([caseKey, caseLogs]) => (
-                            <div key={caseKey}>
-                              <div className="case-group-header">📦 {caseKey} · {caseLogs.length} รายการ</div>
-                              {caseLogs.map(l => (
-                                <div key={l.id} className="log-item">
-                                  <div style={{ flex: 1 }}>
-                                    <div className="log-name">{l.product_name}</div>
-                                    <div className="log-meta">{l.item_code} · {l.brand} · {l.size}</div>
-                                    <div className="log-qty">
-                                      {l.quantity} {l.unit}
-                                      {l.mfg_date ? <span style={{ color: '#10b981', fontWeight: 600, marginLeft: 6 }}>MFG {l.mfg_date}</span> : ''}
-                                      {l.exp_date ? <span style={{ color: '#f59e0b', fontWeight: 600, marginLeft: 6 }}>EXP {l.exp_date}</span> : ''}
-                                      <ExpiryBadge iso={l.exp_at ?? parseThaiDate(l.exp_date)} />
-                                      {l.note ? ` · ${l.note}` : ''}
-                                    </div>
-                                  </div>
-                                  <div className="log-date">{new Date(l.created_at).toLocaleDateString('th-TH', { day: '2-digit', month: '2-digit', year: '2-digit' })}</div>
-                                </div>
-                              ))}
-                            </div>
-                          ))}
-                        </div>
-                      )
-                    })
-                  })()}
+          {tab === 'history' && (() => {
+            const groups = buildSessionGroups(logs)
+            return (
+              <div className="card">
+                <div className="card-header accent">
+                  <h2>📋 ประวัติการบันทึกของฉัน</h2>
+                  {!loadingLogs && groups.length > 0 && (
+                    <span className="badge">{groups.length} หัวข้อ · {logs.length} รายการ</span>
+                  )}
                 </div>
-              )}
-            </div>
-          )}
+                {groups.length > 1 && (
+                  <div className="group-tools">
+                    <button className="btn btn-ghost btn-sm" onClick={() => setAllGroups(groups, true)}>ขยายทั้งหมด</button>
+                    <button className="btn btn-ghost btn-sm" onClick={() => setAllGroups(groups, false)}>หุบทั้งหมด</button>
+                  </div>
+                )}
+                {renderSessionGroups(groups, false)}
+              </div>
+            )
+          })()}
 
           {/* ══════════ TAB: MANAGE ══════════ */}
-          {tab === 'manage' && (
-            <>
-              <div className="card">
-                <div className="card-header"><h2>📤 ดาวน์โหลด / แชร์ข้อมูล</h2></div>
-                <div className="card-body" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                  <div>
-                    <div className="filter-label">กรองตามหัวข้อ</div>
+          {tab === 'manage' && (() => {
+            const filtered = getFilteredLogs()
+            const groups = buildSessionGroups(filtered)
+            return (
+              <>
+                <div className="card">
+                  <div className="card-header"><h2>🗂 เลือกหัวข้อ</h2></div>
+                  <div className="card-body" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
                     <select className="select-inp" value={filterLabel} onChange={e => setFilterLabel(e.target.value)}>
-                      <option value="">— ทั้งหมด —</option>
+                      <option value="">— ทุกหัวข้อ —</option>
                       {allLabels.map(l => <option key={l} value={l}>{l}</option>)}
                     </select>
-                  </div>
-                  {(() => {
-                    const count = getFilteredLogs().length
-                    return count > 0 ? (
+                    {filtered.length > 0 && (
                       <div style={{ fontSize: 12, color: 'var(--text4)', fontFamily: "'IBM Plex Mono',monospace", textAlign: 'center' }}>
-                        {count} รายการ{filterLabel ? ` · หัวข้อ "${filterLabel}"` : ''}
+                        {groups.length} หัวข้อ · {filtered.length} รายการ{filterLabel ? ` · "${filterLabel}"` : ''}
                       </div>
-                    ) : null
-                  })()}
-                  <button className="btn btn-success btn-lg" onClick={handleDownload}>⬇️ Download CSV</button>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 10, fontSize: 11, color: 'var(--text5)', fontFamily: "'IBM Plex Mono',monospace" }}>
-                    <div style={{ flex: 1, borderTop: '1px solid var(--border)' }} />
-                    หรือ
-                    <div style={{ flex: 1, borderTop: '1px solid var(--border)' }} />
-                  </div>
-                  <button className="btn btn-share" onClick={handleShare} disabled={sharing || getFilteredLogs().length === 0}>
-                    {sharing ? '⏳ กำลังเตรียมไฟล์...' : '💚 แชร์ไปยัง LINE / แอปอื่น'}
-                  </button>
-                  {shareMsg && (
-                    <div className={`share-msg ${shareMsg.startsWith('✅') ? 'ok' : shareMsg.startsWith('ℹ️') ? 'info' : 'err'}`}>{shareMsg}</div>
-                  )}
-                  <div className="share-tip">
-                    💡 <strong>วิธีแชร์ไป LINE:</strong> กดปุ่มแชร์ → เลือก LINE → เลือกแชทหรือกลุ่มที่ต้องการ<br/>
-                    ไฟล์ CSV เปิดได้ด้วย Excel หรือ Google Sheets<br/>
-                    คอลัมน์ <strong>ลังที่</strong> และ <strong>จำนวนลังทั้งหมด</strong> จะแสดงแยกชัดเจนแต่ละลัง
+                    )}
+                    <div style={{ display: 'flex', gap: 8 }}>
+                      <button className="btn btn-success btn-md" style={{ flex: 1 }} onClick={handleDownload} disabled={filtered.length === 0}>⬇️ CSV</button>
+                      <button className="btn btn-share btn-md" style={{ flex: 1, width: 'auto', fontSize: 14, padding: '10px 16px' }}
+                        onClick={handleShare} disabled={sharing || filtered.length === 0}>
+                        {sharing ? '⏳...' : '💚 แชร์ LINE'}
+                      </button>
+                    </div>
+                    {shareMsg && (
+                      <div className={`share-msg ${shareMsg.startsWith('✅') ? 'ok' : shareMsg.startsWith('ℹ️') ? 'info' : 'err'}`}>{shareMsg}</div>
+                    )}
                   </div>
                 </div>
-              </div>
 
-              <div className="card">
-                <div className="card-header">
-                  <h2>📝 รายการทั้งหมดของฉัน</h2>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                    {!loadingLogs && logs.length > 0 && (
-                      <span className="badge" style={{ color: 'var(--text4)', borderColor: 'var(--border)', background: 'transparent' }}>{logs.length}</span>
-                    )}
+                <div className="card">
+                  <div className="card-header">
+                    <h2>📝 รายการของฉัน</h2>
                     {logs.length > 0 && (
                       <button className="btn btn-danger btn-sm" onClick={handleDeleteAll}>🗑 ลบทั้งหมด</button>
                     )}
                   </div>
+                  {groups.length > 1 && (
+                    <div className="group-tools">
+                      <button className="btn btn-ghost btn-sm" onClick={() => setAllGroups(groups, true)}>ขยายทั้งหมด</button>
+                      <button className="btn btn-ghost btn-sm" onClick={() => setAllGroups(groups, false)}>หุบทั้งหมด</button>
+                    </div>
+                  )}
+                  {renderSessionGroups(groups, true)}
                 </div>
-                {loadingLogs ? (
-                  <p style={{ textAlign: 'center', color: 'var(--text5)', padding: '32px 0', fontSize: 14 }}>กำลังโหลด...</p>
-                ) : logs.length === 0 ? (
-                  <p style={{ textAlign: 'center', color: 'var(--text5)', padding: '32px 0', fontSize: 14 }}>ไม่มีข้อมูล</p>
-                ) : (
-                  <div className="scroll-area">
-                    {(() => {
-                      const sessionGroups: Record<string, ScanLog[]> = {}
-                      logs.forEach(l => {
-                        const key = l.session_label || '(ไม่มีหัวข้อ)'
-                        if (!sessionGroups[key]) sessionGroups[key] = []
-                        sessionGroups[key].push(l)
-                      })
-                      return Object.entries(sessionGroups).map(([label, items]) => {
-                        const caseGroups: Record<string, ScanLog[]> = {}
-                        items.forEach(l => {
-                          const ckey = l.case_number != null ? `${l.case_number}` : '—'
-                          if (!caseGroups[ckey]) caseGroups[ckey] = []
-                          caseGroups[ckey].push(l)
-                        })
-                        return (
-                          <div key={label}>
-                            <div className="group-header">
-                              📋 {label} · {items.length} รายการ
-                              {items[0]?.total_cases ? ` · ${items[0].total_cases} ลัง` : ''}
-                              {items[0]?.pallet_image_url && (
-                                <img src={items[0].pallet_image_url} alt="pallet"
-                                  style={{ display: 'inline-block', verticalAlign: 'middle', marginLeft: 8, width: 28, height: 28, borderRadius: 6, objectFit: 'cover', border: '1px solid rgba(52,211,153,0.3)', cursor: 'pointer' }}
-                                  onClick={() => window.open(items[0].pallet_image_url!, '_blank')} />
-                              )}
-                            </div>
-                            {Object.entries(caseGroups).map(([caseKey, caseLogs]) => (
-                              <div key={caseKey}>
-                                <div className="case-group-header">📦 ลังที่ {caseKey} · {caseLogs.length} รายการ</div>
-                                {caseLogs.map(l => (
-                                  <div key={l.id}>
-                                    {editingLog?.id === l.id ? (
-                                      <div className="edit-form">
-                                        <p className="edit-title">{l.product_name}</p>
-                                        <div className="qty-row">
-                                          <input type="number" className="qty-input" style={{ fontSize: 16 }}
-                                            value={editingLog.quantity}
-                                            onChange={e => setEditingLog(ev => ev ? { ...ev, quantity: parseInt(e.target.value) || 1 } : ev)} />
-                                        </div>
-                                        <div className="unit-group">
-                                          {unitOptions.map(u => (
-                                            <button key={u} className={`unit-btn ${editingLog.unit === u ? 'active' : ''}`}
-                                              onClick={() => setEditingLog(ev => ev ? { ...ev, unit: u } : ev)}>{u}</button>
-                                          ))}
-                                        </div>
-                                        <input type="text" className="inp-bare" placeholder="หมายเหตุ"
-                                          value={editingLog.note}
-                                          onChange={e => setEditingLog(ev => ev ? { ...ev, note: e.target.value } : ev)} />
-                                        <div style={{ display: 'flex', gap: 8 }}>
-                                          <button className="btn btn-primary btn-md" style={{ flex: 1 }} onClick={handleUpdateLog}>บันทึก</button>
-                                          <button className="btn btn-ghost btn-md" style={{ flex: 1 }} onClick={() => setEditingLog(null)}>ยกเลิก</button>
-                                        </div>
-                                      </div>
-                                    ) : (
-                                      <div className="log-item">
-                                        <div style={{ flex: 1 }}>
-                                          <div className="log-name">{l.product_name}</div>
-                                          <div className="log-meta">{new Date(l.created_at).toLocaleDateString('th-TH', { day: '2-digit', month: '2-digit', year: '2-digit' })}</div>
-                                          <div className="log-qty">
-                                            {l.quantity} {l.unit}
-                                            {l.mfg_date ? <span style={{ color: '#10b981', fontWeight: 600, marginLeft: 6 }}>MFG {l.mfg_date}</span> : ''}
-                                            {l.exp_date ? <span style={{ color: '#f59e0b', fontWeight: 600, marginLeft: 6 }}>EXP {l.exp_date}</span> : ''}
-                                            <ExpiryBadge iso={l.exp_at ?? parseThaiDate(l.exp_date)} />
-                                            {l.note ? ` · ${l.note}` : ''}
-                                          </div>
-                                        </div>
-                                        <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexShrink: 0 }}>
-                                          {l.pallet_image_url && (
-                                            <img src={l.pallet_image_url} alt="pallet" className="pallet-thumb"
-                                              onClick={() => window.open(l.pallet_image_url!, '_blank')} />
-                                          )}
-                                          <button className="btn btn-ghost btn-sm" onClick={() => setEditingLog(l)}>✏️</button>
-                                          <button className="btn btn-danger btn-sm" onClick={() => handleDeleteLog(l.id)}>🗑</button>
-                                        </div>
-                                      </div>
-                                    )}
-                                  </div>
-                                ))}
-                              </div>
-                            ))}
-                          </div>
-                        )
-                      })
-                    })()}
-                  </div>
-                )}
-              </div>
-            </>
-          )}
+
+                <div className="share-tip">
+                  💡 <strong>แชร์ไป LINE:</strong> กดแชร์ → เลือก LINE → เลือกแชทหรือกลุ่ม · ไฟล์ CSV เปิดได้ด้วย Excel หรือ Google Sheets
+                </div>
+              </>
+            )
+          })()}
 
         </div>
       </div>
