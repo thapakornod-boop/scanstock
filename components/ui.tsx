@@ -90,9 +90,15 @@ export function ExpiryBadge({ iso }: { iso: string | null | undefined }) {
 }
 
 // ช่องวันที่ วว/ดด/ปปปป ใส่ / ให้เองระหว่างพิมพ์
-export function DateField({ value, onChange, placeholder }: { value: string; onChange: (v: string) => void; placeholder?: string }) {
+export function DateField({ value, onChange, placeholder, onFocus, onBlur }: {
+  value: string
+  onChange: (v: string) => void
+  placeholder?: string
+  onFocus?: () => void
+  onBlur?: () => void
+}) {
   return (
-    <input type="text" inputMode="numeric" value={value} maxLength={10}
+    <input type="text" inputMode="numeric" value={value} maxLength={10} onFocus={onFocus} onBlur={onBlur}
       placeholder={placeholder ?? 'วว/ดด/ปปปป'}
       onChange={e => onChange(formatDateDigits(e.target.value))}
       className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 tracking-wider outline-none focus:border-brand-500 focus:ring-4 focus:ring-brand-100" />

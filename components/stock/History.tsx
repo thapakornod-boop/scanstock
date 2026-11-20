@@ -7,6 +7,7 @@ import { UNIT_LABEL, type UnitType } from '@/lib/catalog'
 import { formatThaiDate, parseThaiDate } from '@/lib/dates'
 import { lineSummaryText, shareToLine, totalsOf, unitSummary, type Line, type Round } from '@/lib/round'
 import { createClient } from '@/lib/supabase'
+import { buildRoundExcel, shareFile } from '@/lib/excel'
 
 type LogRow = {
   id: string
@@ -147,9 +148,10 @@ export default function History({ employee, toast }: { employee: Employee; toast
                       ))}
                       <div className="flex gap-2 p-3">
                         <button onClick={() => remove(g)} className={`${btnGhost} bg-red-50 text-red-600`}>ลบ</button>
-                        <button onClick={() => shareToLine(lineSummaryText(g.round, employee, Date.parse(g.createdAt)))} className={`${btnLine} flex-1 py-3`}>
-                          💬 ส่งเข้า LINE
+                        <button onClick={() => shareToLine(lineSummaryText(g.round, employee, Date.parse(g.createdAt)))} className={`${btnGhost} flex-1`}>
+                          💬 ข้อความ
                         </button>
+                        <ExcelButton round={g.round} employee={employee} savedAt={Date.parse(g.createdAt)} />
                       </div>
                     </div>
                   )}
@@ -159,5 +161,20 @@ export default function History({ employee, toast }: { employee: Employee; toast
           </div>
         )}
     </div>
+  )
+}
+
+// สร้างไฟล์รอไว้ตอนเปิดรอบ แล้วกดแชร์ได้ทันที
+function ExcelButton({ round, employee, savedAt }: { round: Round; employee: Employee; savedAt: number }) {
+  const [file, setFile] = useState<File | null>(null)
+  useEffect(() => {
+    let alive = true
+    buildRoundExcel(round, employee, savedAt).then(f => { if (alive) setFile(f) }).catch(() => {})
+    return () => { alive = false }
+  }, [round, employee, savedAt])
+  return (
+    <button onClick={() => file && shareFile(file)} disabled={!file} className={`${btnLine} flex-[2] py-3`}>
+      {file ? '📊 ส่ง Excel' : '⏳ เตรียมไฟล์…'}
+    </button>
   )
 }

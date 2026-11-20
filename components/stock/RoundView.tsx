@@ -1,12 +1,13 @@
 'use client'
 
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Sheet, btnGhost, btnLine, btnPrimary, inputClass } from '@/components/ui'
 import type { Employee } from '@/lib/auth'
 import { UNIT_LABEL } from '@/lib/catalog'
 import { formatThaiDate } from '@/lib/dates'
 import { resizeToBase64 } from '@/lib/readLabel'
-import { allLines, isNearExpiry, lineSummaryText, roundCsv, saveRound, shareToLine, totalsOf, unitSummary, type Pallet, type Round } from '@/lib/round'
+import { buildRoundExcel, shareFile } from '@/lib/excel'
+import { allLines, isNearExpiry, lineSummaryText, saveRound, shareToLine, totalsOf, unitSummary, type Pallet, type Round } from '@/lib/round'
 import { createClient } from '@/lib/supabase'
 
 type Toast = (text: string, kind?: 'ok' | 'error' | 'info') => void
@@ -177,7 +178,8 @@ export function FinishView({ round, employee, onBack, onSaved, onNewRound, toast
       toast(`บันทึกแล้ว ${n} รายการ`)
       return true
     } catch (err) {
-      setSaveError((err as Error).message)
+      const msg = (err as Error).message
+      setSaveError(/fetch|network/i.test(msg) ? 'เชื่อมต่ออินเทอร์เน็ตหรือฐานข้อมูลไม่ได้ ลองใหม่อีกครั้ง' : msg)
       toast('บันทึกไม่สำเร็จ ข้อมูลยังอยู่ในเครื่อง', 'error')
       return false
     } finally {
@@ -185,19 +187,23 @@ export function FinishView({ round, employee, onBack, onSaved, onNewRound, toast
     }
   }
 
-  const saveAndShare = async () => {
-    if (saved || await save()) shareToLine(text)
-  }
+  // สร้างไฟล์ Excel รอไว้ก่อน เพื่อให้กดแล้วเปิดเมนูแชร์ได้ทันที
+  const [excel, setExcel] = useState<File | null>(null)
+  const [excelError, setExcelError] = useState('')
+  useEffect(() => {
+    let alive = true
+    buildRoundExcel(round, employee)
+      .then(f => { if (alive) setExcel(f) })
+      .catch(err => { if (alive) setExcelError((err as Error).message) })
+    return () => { alive = false }
+  }, [round, employee])
 
-  const shareCsv = async () => {
-    const file = new File([roundCsv(round, employee)], `${round.label.replace(/\s+/g, '_')}.csv`, { type: 'text/csv' })
-    if (navigator.canShare?.({ files: [file] })) {
-      try { await navigator.share({ files: [file], title: round.label }) } catch {}
-    } else {
-      const a = document.createElement('a')
-      a.href = URL.createObjectURL(file); a.download = file.name; a.click()
-      URL.revokeObjectURL(a.href)
-    }
+  const sendExcel = async () => {
+    if (!excel) return
+    const sharing = shareFile(excel) // เรียกทันทีระหว่างที่ยังนับว่าผู้ใช้กดปุ่มอยู่
+    if (!saved) save() // บันทึกไปพร้อมกัน
+    const result = await sharing
+    if (result === 'downloaded') toast('ดาวน์โหลดไฟล์ Excel แล้ว', 'info')
   }
 
   const copy = async () => {
@@ -251,26 +257,16 @@ export function FinishView({ round, employee, onBack, onSaved, onNewRound, toast
       </div>
 
       <div className="pb-safe fixed inset-x-0 bottom-0 z-20 mx-auto flex max-w-lg flex-col gap-2 bg-gradient-to-t from-slate-50 via-slate-50 to-slate-50/0 px-4 pt-6">
-        {!saved ? (
-          <>
-            <button onClick={saveAndShare} disabled={saving} className={`${btnLine} w-full py-4 text-base`}>
-              {saving ? '⏳ กำลังบันทึก…' : '💾 บันทึก และส่งเข้า LINE'}
-            </button>
-            <div className="flex gap-2">
-              <button onClick={save} disabled={saving} className={`${btnGhost} flex-1`}>บันทึกอย่างเดียว</button>
-              {saveError && <button onClick={() => shareToLine(text)} className={`${btnGhost} flex-1`}>ส่ง LINE อย่างเดียว</button>}
-            </div>
-          </>
-        ) : (
-          <>
-            <button onClick={() => shareToLine(text)} className={`${btnLine} w-full py-4 text-base`}>💬 ส่งเข้า LINE อีกครั้ง</button>
-            <div className="flex gap-2">
-              <button onClick={shareCsv} className={`${btnGhost} flex-1`}>📄 ไฟล์ CSV</button>
-              <button onClick={copy} className={`${btnGhost} flex-1`}>📋 คัดลอก</button>
-            </div>
-            <button onClick={onNewRound} className={`${btnPrimary} w-full`}>เริ่มรอบเช็คใหม่</button>
-          </>
-        )}
+        {excelError && <p className="text-center text-xs text-red-600">สร้างไฟล์ Excel ไม่สำเร็จ: {excelError}</p>}
+        <button onClick={sendExcel} disabled={!excel || saving} className={`${btnLine} w-full py-4 text-base`}>
+          {!excel ? '⏳ กำลังเตรียมไฟล์ Excel…' : saving ? '⏳ กำลังบันทึก…' : saved ? '📊 ส่ง Excel เข้า LINE อีกครั้ง' : '📊 บันทึก และส่ง Excel เข้า LINE'}
+        </button>
+        <div className="flex gap-2">
+          {!saved && <button onClick={save} disabled={saving} className={`${btnGhost} flex-1`}>บันทึกอย่างเดียว</button>}
+          <button onClick={() => shareToLine(text)} className={`${btnGhost} flex-1`}>💬 ส่งเป็นข้อความ</button>
+          {saved && <button onClick={copy} className={`${btnGhost} flex-1`}>📋 คัดลอก</button>}
+        </div>
+        {saved && <button onClick={onNewRound} className={`${btnPrimary} w-full`}>เริ่มรอบเช็คใหม่</button>}
       </div>
     </div>
   )

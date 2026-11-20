@@ -83,6 +83,13 @@ export function updateLine(pallet: Pallet, key: string, patch: Partial<Pick<Line
   return { ...pallet, lines }
 }
 
+// ใส่ EXP/ล็อตเดียวกันให้หลายบรรทัด (เช่น ทั้งสินค้าเป็นล็อตเดียวกันจริง) บรรทัดที่ซ้ำกันจะรวมจำนวน
+export function setBatchForLines(pallet: Pallet, match: (l: Line) => boolean, b: Batch): Pallet {
+  let next = pallet
+  for (const l of pallet.lines.filter(match)) next = updateLine(next, l.key, { exp: b.exp, lot: b.lot.trim() })
+  return next
+}
+
 export function removeLine(pallet: Pallet, key: string): Pallet {
   return { ...pallet, lines: pallet.lines.filter(l => l.key !== key) }
 }
@@ -150,21 +157,6 @@ export function lineSummaryText(round: Round, employee: Employee, savedAt = Date
   out.push('', `รวม ${pallets.length} พาเลท · ${t.lines} รายการ`, `รวม ${unitSummary(t)}`)
   if (near) out.push(`⚠️ หมดอายุ/ใกล้หมด (≤${EXPIRY_WARN_DAYS} วัน) ${near} รายการ`)
   return out.join('\n')
-}
-
-// ── CSV ──
-const csvCell = (v: string | number | null | undefined) => {
-  const s = String(v ?? '')
-  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
-}
-
-export function roundCsv(round: Round, employee: Employee) {
-  const header = ['หัวข้อ', 'สถานที่', 'พาเลท', 'รหัสสินค้า', 'บาร์โค้ด', 'ชื่อสินค้า', 'แบรนด์', 'ขนาด', 'จำนวน', 'หน่วย', 'วันหมดอายุ', 'ล็อต', 'พนักงาน']
-  const rows = round.pallets.flatMap(p => p.lines.map(l => [
-    round.label, round.location, p.label, l.itemCode, l.barcode, l.name, l.brand, l.size, l.qty, UNIT_LABEL[l.unitType],
-    l.exp ? formatThaiDate(l.exp) : '', l.lot, `${employee.name} (${employee.id})`,
-  ]))
-  return '﻿' + [header, ...rows].map(r => r.map(csvCell).join(',')).join('\n')
 }
 
 // ── บันทึกลง Supabase (ตาราง scan_logs เดิม + คอลัมน์ pallet_label, lot, location) ──

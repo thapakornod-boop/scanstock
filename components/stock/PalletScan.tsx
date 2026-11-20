@@ -8,7 +8,7 @@ import { cleanCode, searchProducts, UNIT_LABEL, type Catalog, type Product, type
 import { formatThaiDate, parseThaiDate } from '@/lib/dates'
 import { feedback } from '@/lib/feedback'
 import { readLabelDates } from '@/lib/readLabel'
-import { addToPallet, removeLine, totalsOf, unitSummary, updateLine, type Batch, type Line, type Pallet } from '@/lib/round'
+import { addToPallet, removeLine, setBatchForLines, totalsOf, unitSummary, updateLine, type Batch, type Line, type Pallet } from '@/lib/round'
 
 type Props = {
   pallet: Pallet
@@ -28,7 +28,7 @@ export default function PalletScan({ pallet, catalog, batch, onBatch, onChange, 
   const [manual, setManual] = useState('')
   const [results, setResults] = useState<Product[]>([])
   const [editing, setEditing] = useState<Line | null>(null)
-  const [batchOpen, setBatchOpen] = useState(false)
+  const [typing, setTyping] = useState(false) // กำลังพิมพ์ EXP/ล็อต: หยุดกล้องชั่วคราว
   const [renaming, setRenaming] = useState(false)
   const flashTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
 
@@ -64,7 +64,7 @@ export default function PalletScan({ pallet, catalog, batch, onBatch, onChange, 
     add(hit ? { product: hit.product, barcode: code, unitType: hit.unitType } : { product: null, barcode: code, unitType: 'piece' })
   }, [catalog, add])
 
-  useHardwareScanner(handleCode, !editing && !batchOpen && !renaming)
+  useHardwareScanner(handleCode, !editing && !renaming)
 
   const submitManual = (e: React.FormEvent) => {
     e.preventDefault()
@@ -80,10 +80,6 @@ export default function PalletScan({ pallet, catalog, batch, onBatch, onChange, 
 
   const totals = totalsOf(pallet.lines)
   const last = pallet.lines.find(l => l.key === lastKey) ?? null
-  const batchText = batch.exp || batch.lot
-    ? [batch.exp && `EXP ${formatThaiDate(batch.exp)}`, batch.lot && `ล็อต ${batch.lot}`].filter(Boolean).join(' · ')
-    : 'ยังไม่ระบุ EXP / ล็อต'
-
   return (
     <div className="mx-auto flex min-h-dvh max-w-lg flex-col bg-slate-50">
       {/* แถบหัว */}
@@ -101,19 +97,11 @@ export default function PalletScan({ pallet, catalog, batch, onBatch, onChange, 
       </header>
 
       <div className="flex flex-1 flex-col gap-3 p-3 pb-28">
-        {cameraOn && <Scanner onDetect={handleCode} paused={!!editing || batchOpen || renaming} flash={flash} />}
+        {cameraOn && <Scanner onDetect={handleCode} paused={!!editing || typing || renaming} flash={flash} />}
 
-        {/* ล็อตที่กำลังนับ */}
-        <button onClick={() => setBatchOpen(true)}
-          className={`flex items-center justify-between gap-3 rounded-2xl px-4 py-3 text-left ring-1 ${batch.exp || batch.lot ? 'bg-amber-50 ring-amber-200' : 'bg-white ring-slate-200'}`}>
-          <div className="min-w-0">
-            <div className="text-[11px] text-slate-500">ชิ้นที่สแกนต่อจากนี้จะเป็นล็อต</div>
-            <div className="flex flex-wrap items-center gap-1.5 font-semibold text-slate-800">
-              {batchText} {batch.exp && <ExpiryBadge iso={batch.exp} />}
-            </div>
-          </div>
-          <span className="shrink-0 rounded-full bg-brand-600 px-3 py-1.5 text-xs font-semibold text-white">เปลี่ยน</span>
-        </button>
+        {/* EXP / ล็อตที่กำลังนับ: แสดงตลอด แก้ได้ทันที */}
+        <BatchPanel batch={batch} onBatch={onBatch} onTyping={setTyping} lineCount={pallet.lines.length}
+          onApplyAll={() => { onChange(setBatchForLines(pallet, () => true, batch)); toast('ใส่ EXP/ล็อตให้ทุกรายการในพาเลทแล้ว') }} />
 
         {/* ชิ้นล่าสุด */}
         {last && (
@@ -172,11 +160,17 @@ export default function PalletScan({ pallet, catalog, batch, onBatch, onChange, 
         <button onClick={onDone} className={`${btnPrimary} w-full py-4 text-base`}>✓ เสร็จพาเลทนี้</button>
       </div>
 
-      <BatchSheet open={batchOpen} batch={batch} onClose={() => setBatchOpen(false)}
-        onSave={b => { onBatch(b); setBatchOpen(false); toast(b.exp || b.lot ? 'ตั้งล็อตแล้ว สแกนต่อได้เลย' : 'ล้างล็อตแล้ว', 'info') }} />
       <LineSheet line={editing} onClose={() => setEditing(null)}
         onSave={patch => { if (editing) onChange(updateLine(pallet, editing.key, patch)); setEditing(null) }}
-        onDelete={() => { if (editing) onChange(removeLine(pallet, editing.key)); setEditing(null) }} />
+        onDelete={() => { if (editing) onChange(removeLine(pallet, editing.key)); setEditing(null) }}
+        sameCount={editing ? pallet.lines.filter(l => l.itemCode === editing.itemCode).length : 0}
+        onApplyProduct={patch => {
+          if (!editing) return
+          const updated = updateLine(pallet, editing.key, patch)
+          onChange(setBatchForLines(updated, l => l.itemCode === editing.itemCode, { exp: patch.exp ?? '', lot: patch.lot ?? '' }))
+          setEditing(null)
+          toast('ใส่ EXP/ล็อตเดียวกันทั้งสินค้าแล้ว')
+        }} />
       <RenameSheet open={renaming} value={pallet.label} onClose={() => setRenaming(false)}
         onSave={label => { onChange({ ...pallet, label }); setRenaming(false) }} />
     </div>
@@ -206,33 +200,39 @@ function LineRow({ line, highlight, onClick }: { line: Line; highlight: boolean;
   )
 }
 
-// ตั้ง EXP / ล็อต ที่จะใช้กับชิ้นที่สแกนต่อจากนี้ (พิมพ์ หรือถ่ายรูปฉลาก)
-function BatchSheet({ open, batch, onClose, onSave }: { open: boolean; batch: Batch; onClose: () => void; onSave: (b: Batch) => void }) {
-  const [exp, setExp] = useState('')
-  const [lot, setLot] = useState('')
+// EXP / ล็อต ที่จะใช้กับชิ้นที่สแกนต่อจากนี้ (พิมพ์ หรือถ่ายรูปฉลาก) มีผลทันทีที่วันที่ครบ
+function BatchPanel({ batch, onBatch, onTyping, lineCount, onApplyAll }: {
+  batch: Batch
+  onBatch: (b: Batch) => void
+  onTyping: (typing: boolean) => void
+  lineCount: number
+  onApplyAll: () => void
+}) {
+  const [expText, setExpText] = useState(batch.exp ? formatThaiDate(batch.exp) : '')
+  const [syncedExp, setSyncedExp] = useState(batch.exp)
   const [reading, setReading] = useState(false)
   const [msg, setMsg] = useState('')
   const fileRef = useRef<HTMLInputElement>(null)
-  const [openedFor, setOpenedFor] = useState<Batch | null>(null)
 
-  // เปิดใหม่ทุกครั้ง ให้ค่าเริ่มต้นเป็นล็อตปัจจุบัน
-  if (open && openedFor !== batch) {
-    setOpenedFor(batch)
-    setExp(batch.exp ? formatThaiDate(batch.exp) : '')
-    setLot(batch.lot)
-    setMsg('')
+  // ถ้า EXP ถูกตั้งจากที่อื่น ให้ช่องแสดงตาม
+  if (batch.exp !== syncedExp) {
+    setSyncedExp(batch.exp)
+    if (batch.exp) setExpText(formatThaiDate(batch.exp))
   }
-  if (!open && openedFor) setOpenedFor(null)
 
-  const iso = parseThaiDate(exp)
-  const bad = exp !== '' && !iso
+  const changeExp = (v: string) => {
+    setExpText(v)
+    onBatch({ exp: parseThaiDate(v) ?? '', lot: batch.lot })
+  }
+  const bad = expText !== '' && !parseThaiDate(expText)
+  const active = !!(batch.exp || batch.lot.trim())
 
   const onPhoto = async (file: File | undefined) => {
     if (!file) return
     setReading(true); setMsg('')
     try {
       const d = await readLabelDates(file)
-      if (d.exp) { setExp(formatThaiDate(d.exp)); setMsg(`✅ อ่านได้: "${d.raw ?? ''}" ตรวจสอบก่อนกดใช้`) }
+      if (d.exp) { changeExp(formatThaiDate(d.exp)); setMsg(`✅ อ่านได้: "${d.raw ?? ''}" ตรวจสอบวันที่ด้วย`) }
       else if (d.mfg) setMsg(`⚠️ เจอแค่วันผลิต ${formatThaiDate(d.mfg)} ไม่เจอวันหมดอายุ`)
       else setMsg('⚠️ หาวันที่ไม่เจอ ลองถ่ายใหม่ให้ชัดขึ้น หรือพิมพ์เอง')
     } catch (err) {
@@ -243,39 +243,49 @@ function BatchSheet({ open, batch, onClose, onSave }: { open: boolean; batch: Ba
     }
   }
 
+  const focus = { onFocus: () => onTyping(true), onBlur: () => onTyping(false) }
+
   return (
-    <Sheet open={open} onClose={onClose} title="ตั้ง EXP / ล็อตที่กำลังนับ">
-      <p className="mb-4 text-sm text-slate-500">ทุกชิ้นที่สแกนหลังจากนี้จะถูกนับเป็นล็อตนี้ จนกว่าจะเปลี่ยนอีกครั้ง</p>
-      <input ref={fileRef} type="file" accept="image/*" capture="environment" className="hidden"
-        onChange={e => onPhoto(e.target.files?.[0])} />
-      <button onClick={() => fileRef.current?.click()} disabled={reading} className={`${btnPrimary} mb-2 w-full`}>
-        {reading ? '⏳ กำลังอ่านวันที่…' : '📷 ถ่ายรูปฉลาก อ่าน EXP อัตโนมัติ'}
-      </button>
-      {msg && <p className="mb-2 rounded-xl bg-slate-50 px-3 py-2 text-sm text-slate-700">{msg}</p>}
-      <label className="mt-3 block">
-        <span className="mb-1.5 block text-sm font-medium text-slate-700">วันหมดอายุ (EXP)</span>
-        <DateField value={exp} onChange={setExp} placeholder="วว/ดด/ปปปป เช่น 01/06/2570" />
-      </label>
-      <div className="mt-1.5 min-h-5 text-sm">
-        {bad ? <span className="text-red-600">วันที่ยังไม่ครบหรือไม่ถูกต้อง</span> : <ExpiryBadge iso={iso} />}
+    <div className={`rounded-2xl p-3 ring-1 ${active ? 'bg-amber-50 ring-amber-200' : 'bg-white ring-slate-200'}`}>
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-xs font-medium text-slate-600">EXP / ล็อต ของชิ้นที่สแกนต่อจากนี้</span>
+        {bad ? <span className="text-xs font-semibold text-red-600">วันที่ยังไม่ครบ</span> : <ExpiryBadge iso={batch.exp} />}
       </div>
-      <label className="mt-2 block">
-        <span className="mb-1.5 block text-sm font-medium text-slate-700">ล็อต / Lot no. (ถ้ามี)</span>
-        <input value={lot} onChange={e => setLot(e.target.value)} className={inputClass} placeholder="เช่น L2405A" />
-      </label>
-      <div className="mt-5 mb-2 flex gap-2">
-        <button onClick={() => onSave({ exp: '', lot: '' })} className={`${btnGhost} flex-1`}>ไม่ระบุ</button>
-        <button onClick={() => onSave({ exp: iso ?? '', lot: lot.trim() })} disabled={bad} className={`${btnPrimary} flex-[2]`}>ใช้ล็อตนี้</button>
+      <div className="mt-2 flex gap-2">
+        <div className="min-w-0 flex-[3]">
+          <DateField value={expText} onChange={changeExp} placeholder="EXP วว/ดด/ปปปป" {...focus} />
+        </div>
+        <input value={batch.lot} onChange={e => onBatch({ exp: batch.exp, lot: e.target.value })} placeholder="ล็อต"
+          className={`${inputClass} min-w-0 flex-[2]`} {...focus} />
       </div>
-    </Sheet>
+      <input ref={fileRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={e => onPhoto(e.target.files?.[0])} />
+      <div className="mt-2 flex gap-2">
+        <button onClick={() => fileRef.current?.click()} disabled={reading} className={`${btnPrimary} flex-1 py-2.5 text-sm`}>
+          {reading ? '⏳ กำลังอ่าน…' : '📷 อ่าน EXP จากฉลาก'}
+        </button>
+        {(active || expText) && (
+          <button onClick={() => { setExpText(''); setMsg(''); onBatch({ exp: '', lot: '' }) }} className={`${btnGhost} px-4 py-2.5 text-sm`}>ล้าง</button>
+        )}
+      </div>
+      {msg && <p className="mt-2 rounded-xl bg-white/70 px-3 py-2 text-xs text-slate-700">{msg}</p>}
+      {active && lineCount > 0 && (
+        <button onClick={() => { if (confirm(`ใส่ EXP/ล็อตนี้ให้ทุกรายการที่สแกนแล้วในพาเลทนี้ (${lineCount} รายการ)?
+รายการสินค้าเดียวกันจะถูกรวมจำนวน`)) onApplyAll() }}
+          className="mt-2 w-full rounded-xl bg-white/70 py-2 text-xs font-medium text-amber-800 ring-1 ring-amber-200">
+          ↺ ใส่ EXP/ล็อตนี้ให้ทุกรายการในพาเลท ({lineCount})
+        </button>
+      )}
+    </div>
   )
 }
 
-function LineSheet({ line, onClose, onSave, onDelete }: {
+function LineSheet({ line, onClose, onSave, onDelete, sameCount, onApplyProduct }: {
   line: Line | null
   onClose: () => void
   onSave: (patch: Partial<Pick<Line, 'qty' | 'unitType' | 'exp' | 'lot'>>) => void
   onDelete: () => void
+  sameCount: number // จำนวนรายการของสินค้าเดียวกันในพาเลท
+  onApplyProduct: (patch: Partial<Pick<Line, 'qty' | 'unitType' | 'exp' | 'lot'>>) => void
 }) {
   const [qty, setQty] = useState('')
   const [unit, setUnit] = useState<UnitType>('piece')
@@ -333,6 +343,12 @@ function LineSheet({ line, onClose, onSave, onDelete }: {
               บันทึก
             </button>
           </div>
+          {sameCount > 1 && (
+            <button disabled={bad} onClick={() => onApplyProduct({ qty: n, unitType: unit, exp: iso ?? '', lot: lot.trim() })}
+              className="mb-2 w-full rounded-2xl bg-amber-50 px-4 py-3 text-sm font-semibold text-amber-800 ring-1 ring-amber-200 disabled:opacity-50">
+              ↺ ล็อตเดียวกันทั้งสินค้า: ใช้ EXP/ล็อตนี้กับสินค้านี้ทุกรายการในพาเลท ({sameCount})
+            </button>
+          )}
         </>
       )}
     </Sheet>
