@@ -29,9 +29,20 @@ type Props = {
   toast: (text: string, kind?: 'ok' | 'error' | 'info') => void
 }
 
+// ล็อตที่เพิ่งใช้ จำไว้ในเครื่อง เพื่อเสนอให้แตะเลือกครั้งต่อไป
+const RECENT_LOTS_KEY = 'rsm_recent_lots'
+function loadRecentLots(): string[] {
+  try { return JSON.parse(localStorage.getItem(RECENT_LOTS_KEY) || '[]') } catch { return [] }
+}
+function rememberLot(lot: string) {
+  const list = [lot, ...loadRecentLots().filter(l => l !== lot)].slice(0, 8)
+  try { localStorage.setItem(RECENT_LOTS_KEY, JSON.stringify(list)) } catch {}
+}
+const byNewest = (a: Line, b: Line) => b.updatedAt - a.updatedAt
+
 // รายการล่าสุดของสินค้านี้ในพาเลท (ใช้ EXP/ล็อตเดิมเมื่อสแกนซ้ำ)
 const latestLineOf = (p: Pallet, itemCode: string) =>
-  p.lines.filter(l => l.itemCode === itemCode).sort((a, b) => b.updatedAt - a.updatedAt)[0]
+  p.lines.filter(l => l.itemCode === itemCode).sort(byNewest)[0]
 
 export default function PalletScan({ pallet, catalog, onChange, onDone, toast }: Props) {
   const [cameraOn, setCameraOn] = useState(true)
@@ -47,6 +58,7 @@ export default function PalletScan({ pallet, catalog, onChange, onDone, toast }:
   const [pending, setPending] = useState<Pending | null>(null)
   const [expText, setExpText] = useState('')
   const [lotText, setLotText] = useState('')
+  const [recentLots, setRecentLots] = useState<string[]>([])
   const [seek, setSeek] = useState<SeekState>('idle')
   const [seekRaw, setSeekRaw] = useState('')
   const seekIdRef = useRef(0) // ตัวอ่านที่ id ไม่ตรงจะหยุดเอง
@@ -114,6 +126,7 @@ export default function PalletScan({ pallet, catalog, onChange, onDone, toast }:
     const id = ++pendingIdRef.current
     setPending({ ...item, id, step: 'exp' })
     setExpText(''); setLotText('')
+    setRecentLots(loadRecentLots())
     feedback('new')
     startSeek(id)
   }, [startSeek])
@@ -142,8 +155,10 @@ export default function PalletScan({ pallet, catalog, onChange, onDone, toast }:
   }
   const confirmWizard = (e?: React.FormEvent) => {
     e?.preventDefault()
-    if (!pending || !lotText.trim()) return
-    add(pending, { exp: expIso ?? '', lot: lotText.trim() })
+    if (!pending) return
+    const lot = lotText.trim() // ไม่บังคับกรอก
+    add(pending, { exp: expIso ?? '', lot })
+    if (lot) rememberLot(lot)
     if (!pending.product) toast(`บาร์โค้ด ${pending.barcode} ไม่พบในระบบ — นับเป็น "ไม่พบในระบบ"`, 'error')
     setPending(null); setSeek('idle')
   }
@@ -163,6 +178,16 @@ export default function PalletScan({ pallet, catalog, onChange, onDone, toast }:
     setResults([]); setManual('')
     handleCode(p.barcode_piece || p.item_code)
   }
+
+  // ตัวเลือกล็อต: ล็อตของสินค้านี้ก่อน → ล็อตอื่นในพาเลท → ล็อตที่เพิ่งใช้ในเครื่อง
+  const pendingCode = pending ? (pending.product?.item_code ?? pending.barcode) : ''
+  const lotSuggestions = pending
+    ? [...new Set([
+        ...pallet.lines.filter(l => l.itemCode === pendingCode && l.lot).sort(byNewest).map(l => l.lot),
+        ...pallet.lines.filter(l => l.lot).sort(byNewest).map(l => l.lot),
+        ...recentLots,
+      ])].slice(0, 4)
+    : []
 
   const totals = totalsOf(pallet.lines)
   const last = pallet.lines.find(l => l.key === lastKey) ?? null
@@ -230,18 +255,31 @@ export default function PalletScan({ pallet, catalog, onChange, onDone, toast }:
           </div>
         )}
 
-        {/* ③ ล็อต (บังคับกรอก) */}
+        {/* ③ ล็อต (ไม่บังคับ) */}
         {pending?.step === 'lot' && (
           <form onSubmit={confirmWizard} className="rounded-3xl bg-white p-4 shadow-sm ring-2 ring-brand-400">
-            <WizardTitle no={3} title="ล็อต / Lot no." item={pending} />
+            <WizardTitle no={3} title="ล็อต / Lot no. (ถ้ามี)" item={pending} />
             <button type="button" onClick={() => setPending({ ...pending, step: 'exp' })}
               className="mt-3 flex w-full items-center justify-between rounded-2xl bg-slate-50 px-3 py-2 text-left text-sm">
               <span>EXP: <b>{expIso ? formatThaiDate(expIso) : 'ไม่มี EXP'}</b> {expIso && <ExpiryBadge iso={expIso} />}</span>
               <span className="text-xs text-brand-600">แก้</span>
             </button>
-            <input value={lotText} onChange={e => setLotText(e.target.value)} placeholder="กรอกเลขล็อต (ต้องใส่)" autoFocus
+            {/* ล็อตที่เคยใช้: แตะเพื่อเติมให้เลย */}
+            {lotSuggestions.length > 0 && (
+              <div className="mt-3 flex flex-wrap gap-2">
+                {lotSuggestions.map((lot, i) => (
+                  <button key={lot} type="button" onClick={() => setLotText(lot)}
+                    className={`rounded-full px-3 py-1.5 text-sm font-medium ring-1 ${lotText.trim() === lot
+                      ? 'bg-brand-600 text-white ring-brand-600'
+                      : 'bg-brand-50 text-brand-700 ring-brand-100'}`}>
+                    {i === 0 ? `ใช้ล็อตเดิม: ${lot}` : lot}
+                  </button>
+                ))}
+              </div>
+            )}
+            <input value={lotText} onChange={e => setLotText(e.target.value)} placeholder="กรอกเลขล็อต (ไม่บังคับ)"
               enterKeyHint="done" autoCapitalize="characters" className={`${inputClass} mt-3 text-lg`} />
-            <button type="submit" disabled={!lotText.trim()} className={`${btnPrimary} mt-3 w-full py-4 text-base`}>
+            <button type="submit" className={`${btnPrimary} mt-3 w-full py-4 text-base`}>
               ✓ บันทึก แล้วสแกนต่อ
             </button>
             <button type="button" onClick={cancelWizard} className="mt-3 w-full text-center text-sm text-slate-400 underline">ยกเลิก (ไม่นับชิ้นนี้)</button>
@@ -303,7 +341,7 @@ export default function PalletScan({ pallet, catalog, onChange, onDone, toast }:
         </div>
         {pallet.lines.length === 0 ? (
           <div className="rounded-2xl border-2 border-dashed border-slate-200 p-6 text-center text-sm text-slate-400">
-            เริ่มสแกนได้เลย<br />สินค้าใหม่: สแกน → EXP → ล็อต · สแกนซ้ำ = นับ +1
+            เริ่มสแกนได้เลย<br />สินค้าใหม่: สแกน → EXP → ล็อต (ถ้ามี) · สแกนซ้ำ = นับ +1
           </div>
         ) : (
           <div className="overflow-hidden rounded-2xl bg-white ring-1 ring-slate-200">
