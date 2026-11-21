@@ -14,7 +14,9 @@ const SAME_CODE_GAP_MS = 450
 const SAME_CODE_MIN_INTERVAL_MS = 700
 const SCAN_INTERVAL_MS = 90
 
-type Detector = { detect: (src: HTMLVideoElement) => Promise<{ rawValue: string }[]> }
+type Detector = { detect: (src: HTMLVideoElement | HTMLCanvasElement) => Promise<{ rawValue: string }[]> }
+// อ่านบาร์โค้ดจากภาพย่อ (เร็วกว่า) ส่วนภาพเต็มความละเอียดเก็บไว้ให้ AI อ่านวันที่
+const DETECT_MAX_SIDE = 1280
 
 async function createDetector(): Promise<Detector> {
   const Native = (globalThis as unknown as { BarcodeDetector?: typeof Ponyfill }).BarcodeDetector
@@ -28,10 +30,15 @@ async function createDetector(): Promise<Detector> {
   return new Ponyfill({ formats: FORMATS })
 }
 
-export default function Scanner({ onDetect, paused, flash }: {
+// ดึงภาพปัจจุบันจากกล้อง (jpeg base64 ไม่มี prefix) ใช้ส่งให้ AI อ่านวันหมดอายุ โดยไม่ต้องเปิดกล้องใหม่
+export type CaptureFrame = () => string | null
+
+export default function Scanner({ onDetect, paused, flash, captureRef, overlay }: {
   onDetect: (code: string) => void
   paused: boolean
   flash: 'ok' | 'error' | null // สีกรอบหลังสแกน
+  captureRef?: React.RefObject<CaptureFrame | null>
+  overlay?: React.ReactNode // ปุ่มหรือสถานะที่ลอยอยู่บนภาพกล้อง
 }) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const trackRef = useRef<MediaStreamTrack | null>(null)
@@ -46,6 +53,21 @@ export default function Scanner({ onDetect, paused, flash }: {
   useEffect(() => { pausedRef.current = paused }, [paused])
 
   useEffect(() => {
+    if (!captureRef) return
+    captureRef.current = () => {
+      const v = videoRef.current
+      if (!v || v.readyState < 2 || !v.videoWidth) return null
+      const scale = Math.min(1, 1600 / Math.max(v.videoWidth, v.videoHeight))
+      const canvas = document.createElement('canvas')
+      canvas.width = Math.round(v.videoWidth * scale)
+      canvas.height = Math.round(v.videoHeight * scale)
+      canvas.getContext('2d')?.drawImage(v, 0, 0, canvas.width, canvas.height)
+      return canvas.toDataURL('image/jpeg', 0.88).split(',')[1]
+    }
+    return () => { captureRef.current = null }
+  }, [captureRef])
+
+  useEffect(() => {
     let stopped = false
     let stream: MediaStream | null = null
     let timer: ReturnType<typeof setTimeout> | undefined
@@ -54,7 +76,7 @@ export default function Scanner({ onDetect, paused, flash }: {
     const start = async () => {
       try {
         stream = await navigator.mediaDevices.getUserMedia({
-          video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } },
+          video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } },
           audio: false,
         })
         if (stopped) { stream.getTracks().forEach(t => t.stop()); return }
@@ -67,12 +89,21 @@ export default function Scanner({ onDetect, paused, flash }: {
         setHasTorch(!!caps.torch)
 
         const detector = await createDetector()
+        const small = document.createElement('canvas')
+        const frameForDetect = () => {
+          const scale = DETECT_MAX_SIDE / Math.max(video.videoWidth, video.videoHeight)
+          if (scale >= 1) return video
+          small.width = Math.round(video.videoWidth * scale)
+          small.height = Math.round(video.videoHeight * scale)
+          small.getContext('2d')?.drawImage(video, 0, 0, small.width, small.height)
+          return small
+        }
         setReady(true)
         const loop = async () => {
           if (stopped) return
           if (!pausedRef.current && video.readyState >= 2) {
             try {
-              const found = await detector.detect(video)
+              const found = await detector.detect(frameForDetect())
               const code = found[0]?.rawValue?.trim()
               const now = Date.now()
               if (code) {
@@ -138,6 +169,7 @@ export default function Scanner({ onDetect, paused, flash }: {
       <div className="absolute top-3 left-3 rounded-full bg-black/50 px-3 py-1 text-xs text-white">
         {!ready ? 'กำลังเปิดกล้อง…' : paused ? '⏸ หยุดสแกน' : '● พร้อมสแกน'}
       </div>
+      {overlay}
       {hasTorch && (
         <button onClick={toggleTorch}
           className={`absolute top-3 right-3 rounded-full px-3 py-1 text-xs font-medium ${torchOn ? 'bg-amber-300 text-slate-900' : 'bg-black/50 text-white'}`}>

@@ -19,10 +19,14 @@ function resizeToBase64(file: File) {
   })
 }
 
-export type LabelDates = { mfg: string | null; exp: string | null; raw: string | null }
+export type LabelDates = { mfg: string | null; exp: string | null; lot: string | null; raw: string | null }
 
 export async function readLabelDates(file: File): Promise<LabelDates> {
-  const image = await resizeToBase64(file)
+  return readLabelImage(await resizeToBase64(file))
+}
+
+// อ่านจากภาพ base64 (jpeg) เช่นเฟรมจากกล้องที่ใช้สแกนบาร์โค้ด
+export async function readLabelImage(image: string): Promise<LabelDates> {
   const res = await fetch('/api/read-date', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
