@@ -1,6 +1,6 @@
 'use client'
 
-import { useCallback, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import Scanner, { type CaptureFrame } from '@/components/Scanner'
 import { useHardwareScanner } from '@/components/useHardwareScanner'
 import { DateField, ExpiryBadge, Sheet, btnGhost, btnPrimary, inputClass } from '@/components/ui'
@@ -9,6 +9,11 @@ import { formatThaiDate, parseThaiDate } from '@/lib/dates'
 import { feedback } from '@/lib/feedback'
 import { readLabelDates, readLabelImage } from '@/lib/readLabel'
 import { addToPallet, lineKey, removeLine, setBatchForLines, totalsOf, unitSummary, updateLine, type Batch, type Line, type Pallet } from '@/lib/round'
+
+type ReadResult = 'exp' | 'partial' | 'none' | 'busy' | 'quota' | 'error'
+const SEEK_MS = 20000 // หา EXP นานสุดต่อสินค้าใหม่ 1 ตัว
+const SEEK_INTERVAL_MS = 1500
+const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 
 type Props = {
   pallet: Pallet
@@ -40,7 +45,12 @@ export default function PalletScan({ pallet, catalog, batch, onBatch, onChange, 
     try { return localStorage.getItem('rsm_auto_exp') !== '0' } catch { return true }
   })
   const lastKeyRef = useRef<string | null>(null)
-  const readExpRef = useRef<(auto: boolean, targetKey: string | null) => void>(() => {})
+  const readExpRef = useRef<(auto: boolean, targetKey: string | null) => Promise<ReadResult>>(async () => 'none')
+  // หา EXP อัตโนมัติ: ลองอ่านจากกล้องซ้ำจนกว่าจะเจอ (ให้ผู้ใช้แค่หันกล้องไปที่วันที่)
+  const seekRef = useRef<{ key: string; until: number } | null>(null)
+  const seekLoopRef = useRef(false)
+  const [seeking, setSeeking] = useState(false)
+  const activeRef = useRef(true) // กล้องเปิดและไม่ได้เปิดหน้าต่างอื่นทับ
 
   // ใช้ ref เพื่อให้สแกนรัวๆ แล้วอ่านพาเลทล่าสุดเสมอ (ไม่ตกหล่นระหว่าง re-render)
   const palletRef = useRef(pallet)
@@ -48,7 +58,35 @@ export default function PalletScan({ pallet, catalog, batch, onBatch, onChange, 
   useLayoutEffect(() => {
     palletRef.current = pallet
     batchRef.current = batch
-  }, [pallet, batch])
+    activeRef.current = cameraOn && !editing && !typing && !renaming
+  }, [pallet, batch, cameraOn, editing, typing, renaming])
+  useEffect(() => () => { seekRef.current = null }, [])
+
+  const startSeek = useCallback((key: string) => {
+    seekRef.current = { key, until: Date.now() + SEEK_MS }
+    setSeeking(true)
+    if (seekLoopRef.current) return // ลูปเดิมยังทำงานอยู่ จะหยิบเป้าหมายใหม่ไปเอง
+    seekLoopRef.current = true
+    const loop = async () => {
+      while (seekRef.current && Date.now() < seekRef.current.until) {
+        if (!activeRef.current) { await sleep(400); continue }
+        const target = seekRef.current
+        const r = await readExpRef.current(true, target.key)
+        if (r === 'exp') {
+          if (seekRef.current === target) seekRef.current = null // เจอแล้ว หยุดหา (ถ้าไม่มีสินค้าใหม่มาแทน)
+          continue
+        }
+        if (r === 'quota') { toast('อ่าน EXP อัตโนมัติเกินโควต้า หยุดหาชั่วคราว', 'error'); break }
+        const key = seekRef.current?.key
+        if (!key || !palletRef.current.lines.some(l => l.key === key)) break // รายการถูกลบ/รวมไปแล้ว
+        await sleep(SEEK_INTERVAL_MS)
+      }
+      seekRef.current = null
+      seekLoopRef.current = false
+      setSeeking(false)
+    }
+    loop()
+  }, [toast])
 
   const add = useCallback((item: { product: Product | null; barcode: string; unitType: UnitType }, qty = 1) => {
     const before = palletRef.current
@@ -66,23 +104,23 @@ export default function PalletScan({ pallet, catalog, batch, onBatch, onChange, 
     clearTimeout(flashTimer.current)
     flashTimer.current = setTimeout(() => setFlash(null), 250)
     if (!item.product) toast(`ไม่พบบาร์โค้ด ${item.barcode} ในระบบ — นับเป็น "ไม่พบในระบบ" ไว้ก่อน`, 'error')
-    // เจอสินค้าใหม่ในพาเลท → ถ่ายภาพจากกล้องเดียวกันไปอ่าน EXP/ล็อตให้อัตโนมัติ
-    else if (isNewLine && autoRead) readExpRef.current(true, line.key)
-  }, [onChange, toast, autoRead])
+    // เจอสินค้าใหม่ในพาเลท → เริ่มหา EXP/ล็อตจากกล้องเดียวกันเองทันที
+    else if (isNewLine && autoRead) startSeek(line.key)
+  }, [onChange, toast, autoRead, startSeek])
 
   // ส่งภาพปัจจุบันจากกล้องให้ AI อ่าน แล้วเติม EXP/ล็อตให้ชิ้นที่สแกนต่อจากนี้
-  // และใส่ให้ชิ้นที่เพิ่งสแกนด้วย (อัตโนมัติ: ชิ้นใหม่ที่เพิ่งเจอ / กดเอง: ชิ้นล่าสุดถ้ายังไม่มี EXP)
-  const readExp = useCallback(async (auto: boolean, targetKey: string | null) => {
-    if (readingRef.current) return
+  // และใส่ให้ชิ้นเป้าหมายด้วย (อัตโนมัติ: สินค้าใหม่ที่กำลังหา / กดเอง: ชิ้นล่าสุดถ้ายังไม่มี EXP)
+  const readExp = useCallback(async (auto: boolean, targetKey: string | null): Promise<ReadResult> => {
+    if (readingRef.current) return 'busy'
     const image = captureRef.current?.()
-    if (!image) { if (!auto) toast('กล้องยังไม่พร้อม', 'error'); return }
+    if (!image) { if (!auto) toast('กล้องยังไม่พร้อม', 'error'); return 'none' }
     readingRef.current = true
     setReadingExp(true)
     try {
       const d = await readLabelImage(image)
       if (!d.exp && !d.lot) {
         if (!auto) toast('ไม่เจอวันหมดอายุในภาพ ลองหันกล้องไปที่วันที่ให้ชัดขึ้น', 'info')
-        return
+        return 'none'
       }
       const b: Batch = { exp: d.exp ?? batchRef.current.exp, lot: d.lot ?? batchRef.current.lot }
       batchRef.current = b
@@ -91,17 +129,22 @@ export default function PalletScan({ pallet, catalog, batch, onBatch, onChange, 
       const key = targetKey ?? lastKeyRef.current
       const target = key ? p.lines.find(l => l.key === key) : undefined
       if (target && (auto || !target.exp)) {
-        const next = updateLine(p, target.key, { exp: b.exp, lot: b.lot.trim() })
+        // ใส่เฉพาะค่าที่อ่านได้ ค่าที่อ่านไม่ได้คงของเดิมไว้
+        const patch = { ...(d.exp ? { exp: d.exp } : {}), ...(d.lot ? { lot: d.lot } : {}) }
+        const next = updateLine(p, target.key, patch)
         palletRef.current = next
         onChange(next)
-        const newKey = lineKey(target.itemCode, target.unitType, b)
-        setLastKey(newKey)
-        lastKeyRef.current = newKey
+        const newKey = lineKey(target.itemCode, target.unitType, { exp: patch.exp ?? target.exp, lot: patch.lot ?? target.lot })
+        if (lastKeyRef.current === target.key) { setLastKey(newKey); lastKeyRef.current = newKey }
+        if (seekRef.current?.key === target.key) seekRef.current.key = newKey
       }
       feedback('new')
-      toast(`📅 ${auto ? 'อ่านอัตโนมัติ ' : ''}${b.exp ? `EXP ${formatThaiDate(b.exp)}` : ''}${d.lot ? ` · ล็อต ${d.lot}` : ''}`, 'info')
+      toast(`📅 ${auto ? 'เจอ ' : ''}${d.exp ? `EXP ${formatThaiDate(d.exp)}` : ''}${d.lot ? ` · ล็อต ${d.lot}` : ''}`, 'info')
+      return d.exp ? 'exp' : 'partial'
     } catch (err) {
-      if (!auto) toast((err as Error).message, 'error')
+      const msg = (err as Error).message
+      if (!auto) toast(msg, 'error')
+      return /โควต้า/.test(msg) ? 'quota' : 'error'
     } finally {
       readingRef.current = false
       setReadingExp(false)
@@ -112,6 +155,7 @@ export default function PalletScan({ pallet, catalog, batch, onBatch, onChange, 
   const toggleAutoRead = () => {
     const next = !autoRead
     setAutoRead(next)
+    if (!next) seekRef.current = null
     try { localStorage.setItem('rsm_auto_exp', next ? '1' : '0') } catch {}
   }
 
@@ -157,12 +201,17 @@ export default function PalletScan({ pallet, catalog, batch, onBatch, onChange, 
       <div className="flex flex-1 flex-col gap-3 p-3 pb-28">
         {cameraOn && (
           <Scanner onDetect={handleCode} paused={!!editing || typing || renaming} flash={flash} captureRef={captureRef}
-            overlay={
+            overlay={seeking ? (
+              <div className="absolute inset-x-3 bottom-3 flex items-center gap-2 rounded-full bg-amber-400/95 px-4 py-2 text-sm font-semibold text-slate-900 shadow-lg">
+                <span className="inline-block h-2.5 w-2.5 animate-ping rounded-full bg-slate-900" />
+                🔍 กำลังหา EXP… หันกล้องไปที่วันหมดอายุ
+              </div>
+            ) : (
               <button onClick={() => readExp(false, null)} disabled={readingExp}
                 className="absolute right-3 bottom-3 rounded-full bg-amber-400 px-4 py-2 text-sm font-semibold text-slate-900 shadow-lg active:scale-95 disabled:opacity-80">
                 {readingExp ? '⏳ กำลังอ่าน EXP…' : '📅 อ่าน EXP'}
               </button>
-            } />
+            )} />
         )}
 
         {/* EXP / ล็อตที่กำลังนับ: แสดงตลอด แก้ได้ทันที */}
@@ -340,7 +389,7 @@ function BatchPanel({ batch, onBatch, onTyping, lineCount, onApplyAll, cameraOn,
             <span className={`relative h-5 w-9 shrink-0 rounded-full transition ${autoRead ? 'bg-brand-600' : 'bg-slate-300'}`}>
               <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-all ${autoRead ? 'left-[18px]' : 'left-0.5'}`} />
             </span>
-            <span>อ่าน EXP/ล็อตอัตโนมัติจากกล้อง<br />เมื่อสแกนเจอสินค้าใหม่</span>
+            <span>หา EXP/ล็อตอัตโนมัติจากกล้อง<br />เมื่อสแกนเจอสินค้าใหม่ (ไม่ต้องกด)</span>
           </button>
         ) : (
           <button onClick={() => fileRef.current?.click()} disabled={reading} className={`${btnPrimary} flex-1 py-2.5 text-sm`}>
