@@ -57,12 +57,12 @@ export default function Scanner({ onDetect, paused, flash, captureRef, overlay }
     captureRef.current = () => {
       const v = videoRef.current
       if (!v || v.readyState < 2 || !v.videoWidth) return null
-      const scale = Math.min(1, 1600 / Math.max(v.videoWidth, v.videoHeight))
+      const scale = Math.min(1, 1024 / Math.max(v.videoWidth, v.videoHeight))
       const canvas = document.createElement('canvas')
       canvas.width = Math.round(v.videoWidth * scale)
       canvas.height = Math.round(v.videoHeight * scale)
       canvas.getContext('2d')?.drawImage(v, 0, 0, canvas.width, canvas.height)
-      return canvas.toDataURL('image/jpeg', 0.88).split(',')[1]
+      return canvas.toDataURL('image/jpeg', 0.82).split(',')[1]
     }
     return () => { captureRef.current = null }
   }, [captureRef])

@@ -1,31 +1,39 @@
 'use client'
 
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import Scanner, { type CaptureFrame } from '@/components/Scanner'
 import { useHardwareScanner } from '@/components/useHardwareScanner'
 import { DateField, ExpiryBadge, Sheet, btnGhost, btnPrimary, inputClass } from '@/components/ui'
 import { cleanCode, searchProducts, UNIT_LABEL, type Catalog, type Product, type UnitType } from '@/lib/catalog'
 import { formatThaiDate, parseThaiDate } from '@/lib/dates'
 import { feedback } from '@/lib/feedback'
-import { readLabelDates, readLabelImage } from '@/lib/readLabel'
-import { addToPallet, lineKey, removeLine, setBatchForLines, totalsOf, unitSummary, updateLine, type Batch, type Line, type Pallet } from '@/lib/round'
+import { readLabelImage } from '@/lib/readLabel'
+import { addToPallet, removeLine, setBatchForLines, totalsOf, unitSummary, updateLine, type Batch, type Line, type Pallet } from '@/lib/round'
 
-type ReadResult = 'exp' | 'partial' | 'none' | 'busy' | 'quota' | 'error'
-const SEEK_MS = 20000 // หา EXP นานสุดต่อสินค้าใหม่ 1 ตัว
-const SEEK_INTERVAL_MS = 1500
+// หา EXP จากกล้อง: 2 ตัวอ่านทำงานสลับกันโดยไม่พัก ได้ผลใหม่เกือบทุกวินาที
+const SEEK_MS = 15000
+const SEEK_WORKERS = 2
+const SEEK_STAGGER_MS = 700
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
+
+type ScanItem = { product: Product | null; barcode: string; unitType: UnitType }
+// สินค้าใหม่ที่กำลังกรอกทีละขั้น: ① สแกนแล้ว → ② EXP → ③ ล็อต
+type Pending = ScanItem & { id: number; step: 'exp' | 'lot' }
+type SeekState = 'idle' | 'seeking' | 'found' | 'timeout'
 
 type Props = {
   pallet: Pallet
   catalog: Catalog | null
-  batch: Batch
-  onBatch: (b: Batch) => void
   onChange: (p: Pallet) => void
   onDone: () => void
   toast: (text: string, kind?: 'ok' | 'error' | 'info') => void
 }
 
-export default function PalletScan({ pallet, catalog, batch, onBatch, onChange, onDone, toast }: Props) {
+// รายการล่าสุดของสินค้านี้ในพาเลท (ใช้ EXP/ล็อตเดิมเมื่อสแกนซ้ำ)
+const latestLineOf = (p: Pallet, itemCode: string) =>
+  p.lines.filter(l => l.itemCode === itemCode).sort((a, b) => b.updatedAt - a.updatedAt)[0]
+
+export default function PalletScan({ pallet, catalog, onChange, onDone, toast }: Props) {
   const [cameraOn, setCameraOn] = useState(true)
   const [flash, setFlash] = useState<'ok' | 'error' | null>(null)
   const [lastKey, setLastKey] = useState<string | null>(null)
@@ -33,140 +41,112 @@ export default function PalletScan({ pallet, catalog, batch, onBatch, onChange, 
   const [manual, setManual] = useState('')
   const [results, setResults] = useState<Product[]>([])
   const [editing, setEditing] = useState<Line | null>(null)
-  const [typing, setTyping] = useState(false) // กำลังพิมพ์ EXP/ล็อต: หยุดกล้องชั่วคราว
   const [renaming, setRenaming] = useState(false)
   const flashTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
 
-  // อ่าน EXP/ล็อตจากกล้องตัวเดียวกับที่สแกนบาร์โค้ด
+  const [pending, setPending] = useState<Pending | null>(null)
+  const [expText, setExpText] = useState('')
+  const [lotText, setLotText] = useState('')
+  const [seek, setSeek] = useState<SeekState>('idle')
+  const [seekRaw, setSeekRaw] = useState('')
+  const seekIdRef = useRef(0) // ตัวอ่านที่ id ไม่ตรงจะหยุดเอง
   const captureRef = useRef<CaptureFrame | null>(null)
-  const [readingExp, setReadingExp] = useState(false)
-  const readingRef = useRef(false)
-  const [autoRead, setAutoRead] = useState(() => {
-    try { return localStorage.getItem('rsm_auto_exp') !== '0' } catch { return true }
-  })
-  const lastKeyRef = useRef<string | null>(null)
-  const readExpRef = useRef<(auto: boolean, targetKey: string | null) => Promise<ReadResult>>(async () => 'none')
-  // หา EXP อัตโนมัติ: ลองอ่านจากกล้องซ้ำจนกว่าจะเจอ (ให้ผู้ใช้แค่หันกล้องไปที่วันที่)
-  const seekRef = useRef<{ key: string; until: number } | null>(null)
-  const seekLoopRef = useRef(false)
-  const [seeking, setSeeking] = useState(false)
-  const activeRef = useRef(true) // กล้องเปิดและไม่ได้เปิดหน้าต่างอื่นทับ
+  const pendingIdRef = useRef(0)
 
   // ใช้ ref เพื่อให้สแกนรัวๆ แล้วอ่านพาเลทล่าสุดเสมอ (ไม่ตกหล่นระหว่าง re-render)
   const palletRef = useRef(pallet)
-  const batchRef = useRef(batch)
-  useLayoutEffect(() => {
-    palletRef.current = pallet
-    batchRef.current = batch
-    activeRef.current = cameraOn && !editing && !typing && !renaming
-  }, [pallet, batch, cameraOn, editing, typing, renaming])
-  useEffect(() => () => { seekRef.current = null }, [])
+  useEffect(() => { palletRef.current = pallet }, [pallet])
+  useEffect(() => () => { seekIdRef.current = -1 }, [])
 
-  const startSeek = useCallback((key: string) => {
-    seekRef.current = { key, until: Date.now() + SEEK_MS }
-    setSeeking(true)
-    if (seekLoopRef.current) return // ลูปเดิมยังทำงานอยู่ จะหยิบเป้าหมายใหม่ไปเอง
-    seekLoopRef.current = true
-    const loop = async () => {
-      while (seekRef.current && Date.now() < seekRef.current.until) {
-        if (!activeRef.current) { await sleep(400); continue }
-        const target = seekRef.current
-        const r = await readExpRef.current(true, target.key)
-        if (r === 'exp') {
-          if (seekRef.current === target) seekRef.current = null // เจอแล้ว หยุดหา (ถ้าไม่มีสินค้าใหม่มาแทน)
-          continue
-        }
-        if (r === 'quota') { toast('อ่าน EXP อัตโนมัติเกินโควต้า หยุดหาชั่วคราว', 'error'); break }
-        const key = seekRef.current?.key
-        if (!key || !palletRef.current.lines.some(l => l.key === key)) break // รายการถูกลบ/รวมไปแล้ว
-        await sleep(SEEK_INTERVAL_MS)
-      }
-      seekRef.current = null
-      seekLoopRef.current = false
-      setSeeking(false)
-    }
-    loop()
-  }, [toast])
-
-  const add = useCallback((item: { product: Product | null; barcode: string; unitType: UnitType }, qty = 1) => {
-    const before = palletRef.current
-    const next = addToPallet(before, item, batchRef.current, qty)
+  const add = useCallback((item: ScanItem, batch: Batch) => {
+    const next = addToPallet(palletRef.current, item, batch)
     const line = next.lines[0]
-    const isNewLine = !before.lines.some(l => l.key === line.key)
     palletRef.current = next
     onChange(next)
     setLastKey(line.key)
-    lastKeyRef.current = line.key
     setPulse(n => n + 1)
-    const kind = item.product ? 'ok' : 'error'
-    feedback(item.product ? (isNewLine ? 'new' : 'ok') : 'error')
-    setFlash(kind)
+    feedback(item.product ? 'ok' : 'error')
+    setFlash(item.product ? 'ok' : 'error')
     clearTimeout(flashTimer.current)
     flashTimer.current = setTimeout(() => setFlash(null), 250)
-    if (!item.product) toast(`ไม่พบบาร์โค้ด ${item.barcode} ในระบบ — นับเป็น "ไม่พบในระบบ" ไว้ก่อน`, 'error')
-    // เจอสินค้าใหม่ในพาเลท → เริ่มหา EXP/ล็อตจากกล้องเดียวกันเองทันที
-    else if (isNewLine && autoRead) startSeek(line.key)
-  }, [onChange, toast, autoRead, startSeek])
+  }, [onChange])
 
-  // ส่งภาพปัจจุบันจากกล้องให้ AI อ่าน แล้วเติม EXP/ล็อตให้ชิ้นที่สแกนต่อจากนี้
-  // และใส่ให้ชิ้นเป้าหมายด้วย (อัตโนมัติ: สินค้าใหม่ที่กำลังหา / กดเอง: ชิ้นล่าสุดถ้ายังไม่มี EXP)
-  const readExp = useCallback(async (auto: boolean, targetKey: string | null): Promise<ReadResult> => {
-    if (readingRef.current) return 'busy'
-    const image = captureRef.current?.()
-    if (!image) { if (!auto) toast('กล้องยังไม่พร้อม', 'error'); return 'none' }
-    readingRef.current = true
-    setReadingExp(true)
-    try {
-      const d = await readLabelImage(image)
-      if (!d.exp && !d.lot) {
-        if (!auto) toast('ไม่เจอวันหมดอายุในภาพ ลองหันกล้องไปที่วันที่ให้ชัดขึ้น', 'info')
-        return 'none'
+  const stopSeek = () => { seekIdRef.current = 0 }
+
+  // ② อ่าน EXP จากกล้องตัวเดียวกันเรื่อยๆ จนเจอ แล้วไปขั้นล็อตเอง
+  const startSeek = useCallback((pendingId: number) => {
+    const id = Date.now()
+    seekIdRef.current = id
+    setSeek('seeking'); setSeekRaw('')
+    const until = Date.now() + SEEK_MS
+    const worker = async (delay: number) => {
+      await sleep(delay)
+      while (seekIdRef.current === id && Date.now() < until) {
+        const image = captureRef.current?.()
+        if (!image) { await sleep(300); continue }
+        try {
+          const d = await readLabelImage(image)
+          if (seekIdRef.current !== id || pendingIdRef.current !== pendingId) return
+          if (d.exp) {
+            seekIdRef.current = 0
+            setExpText(formatThaiDate(d.exp))
+            setSeekRaw(d.raw ?? '')
+            setSeek('found')
+            feedback('new')
+            setPending(p => (p && p.id === pendingId ? { ...p, step: 'lot' } : p))
+            return
+          }
+        } catch (err) {
+          if (/โควต้า/.test((err as Error).message)) {
+            if (seekIdRef.current === id) { seekIdRef.current = 0; setSeek('timeout'); toast('อ่าน EXP เกินโควต้า พิมพ์เองไปก่อน', 'error') }
+            return
+          }
+          await sleep(500)
+        }
       }
-      const b: Batch = { exp: d.exp ?? batchRef.current.exp, lot: d.lot ?? batchRef.current.lot }
-      batchRef.current = b
-      onBatch(b)
-      const p = palletRef.current
-      const key = targetKey ?? lastKeyRef.current
-      const target = key ? p.lines.find(l => l.key === key) : undefined
-      if (target && (auto || !target.exp)) {
-        // ใส่เฉพาะค่าที่อ่านได้ ค่าที่อ่านไม่ได้คงของเดิมไว้
-        const patch = { ...(d.exp ? { exp: d.exp } : {}), ...(d.lot ? { lot: d.lot } : {}) }
-        const next = updateLine(p, target.key, patch)
-        palletRef.current = next
-        onChange(next)
-        const newKey = lineKey(target.itemCode, target.unitType, { exp: patch.exp ?? target.exp, lot: patch.lot ?? target.lot })
-        if (lastKeyRef.current === target.key) { setLastKey(newKey); lastKeyRef.current = newKey }
-        if (seekRef.current?.key === target.key) seekRef.current.key = newKey
-      }
-      feedback('new')
-      toast(`📅 ${auto ? 'เจอ ' : ''}${d.exp ? `EXP ${formatThaiDate(d.exp)}` : ''}${d.lot ? ` · ล็อต ${d.lot}` : ''}`, 'info')
-      return d.exp ? 'exp' : 'partial'
-    } catch (err) {
-      const msg = (err as Error).message
-      if (!auto) toast(msg, 'error')
-      return /โควต้า/.test(msg) ? 'quota' : 'error'
-    } finally {
-      readingRef.current = false
-      setReadingExp(false)
+      if (seekIdRef.current === id) { seekIdRef.current = 0; setSeek('timeout') }
     }
-  }, [onBatch, onChange, toast])
-  useLayoutEffect(() => { readExpRef.current = readExp }, [readExp])
+    for (let i = 0; i < SEEK_WORKERS; i++) worker(i * SEEK_STAGGER_MS)
+  }, [toast])
 
-  const toggleAutoRead = () => {
-    const next = !autoRead
-    setAutoRead(next)
-    if (!next) seekRef.current = null
-    try { localStorage.setItem('rsm_auto_exp', next ? '1' : '0') } catch {}
-  }
+  // ① สแกนเจอสินค้าใหม่ (หรือกด "คนละล็อต") → เริ่มขั้น EXP
+  const startWizard = useCallback((item: ScanItem) => {
+    const id = ++pendingIdRef.current
+    setPending({ ...item, id, step: 'exp' })
+    setExpText(''); setLotText('')
+    feedback('new')
+    startSeek(id)
+  }, [startSeek])
 
   const handleCode = useCallback((raw: string) => {
     const code = cleanCode(raw)
     if (!code) return
     const hit = catalog?.byCode.get(code)
-    add(hit ? { product: hit.product, barcode: code, unitType: hit.unitType } : { product: null, barcode: code, unitType: 'piece' })
-  }, [catalog, add])
+    const item: ScanItem = hit ? { product: hit.product, barcode: code, unitType: hit.unitType } : { product: null, barcode: code, unitType: 'piece' }
+    const known = latestLineOf(palletRef.current, item.product?.item_code ?? code)
+    // สินค้าที่มีในพาเลทแล้ว → นับ +1 เข้าล็อตล่าสุดของสินค้านั้นทันที
+    if (known) add(item, { exp: known.exp, lot: known.lot })
+    else startWizard(item)
+  }, [catalog, add, startWizard])
 
-  useHardwareScanner(handleCode, !editing && !renaming)
+  useHardwareScanner(handleCode, !pending && !editing && !renaming)
+
+  const cancelWizard = () => { stopSeek(); setPending(null); setSeek('idle') }
+  const expIso = parseThaiDate(expText)
+  const expBad = expText !== '' && !expIso
+  const goLot = (noExp: boolean) => {
+    if (!pending) return
+    stopSeek()
+    if (noExp) setExpText('')
+    setPending({ ...pending, step: 'lot' })
+  }
+  const confirmWizard = (e?: React.FormEvent) => {
+    e?.preventDefault()
+    if (!pending || !lotText.trim()) return
+    add(pending, { exp: expIso ?? '', lot: lotText.trim() })
+    if (!pending.product) toast(`บาร์โค้ด ${pending.barcode} ไม่พบในระบบ — นับเป็น "ไม่พบในระบบ"`, 'error')
+    setPending(null); setSeek('idle')
+  }
 
   const submitManual = (e: React.FormEvent) => {
     e.preventDefault()
@@ -179,9 +159,16 @@ export default function PalletScan({ pallet, catalog, batch, onBatch, onChange, 
     setResults(found)
     if (!found.length) toast('ไม่พบสินค้าที่ค้นหา', 'info')
   }
+  const pickProduct = (p: Product) => {
+    setResults([]); setManual('')
+    handleCode(p.barcode_piece || p.item_code)
+  }
 
   const totals = totalsOf(pallet.lines)
   const last = pallet.lines.find(l => l.key === lastKey) ?? null
+  const newLotFor = (l: Line) =>
+    startWizard({ product: catalog?.byCode.get(l.barcode)?.product ?? null, barcode: l.barcode, unitType: l.unitType })
+
   return (
     <div className="mx-auto flex min-h-dvh max-w-lg flex-col bg-slate-50">
       {/* แถบหัว */}
@@ -196,64 +183,117 @@ export default function PalletScan({ pallet, catalog, batch, onBatch, onChange, 
             {cameraOn ? '📷 ปิดกล้อง' : '📷 เปิดกล้อง'}
           </button>
         </div>
+        <Steps step={pending ? (pending.step === 'exp' ? 2 : 3) : 1} />
       </header>
 
       <div className="flex flex-1 flex-col gap-3 p-3 pb-28">
         {cameraOn && (
-          <Scanner onDetect={handleCode} paused={!!editing || typing || renaming} flash={flash} captureRef={captureRef}
-            overlay={seeking ? (
+          <Scanner onDetect={handleCode} paused={!!pending || !!editing || renaming} flash={flash} captureRef={captureRef}
+            overlay={pending?.step === 'exp' && seek === 'seeking' && (
               <div className="absolute inset-x-3 bottom-3 flex items-center gap-2 rounded-full bg-amber-400/95 px-4 py-2 text-sm font-semibold text-slate-900 shadow-lg">
                 <span className="inline-block h-2.5 w-2.5 animate-ping rounded-full bg-slate-900" />
-                🔍 กำลังหา EXP… หันกล้องไปที่วันหมดอายุ
+                🔍 หันกล้องไปที่วันหมดอายุ…
               </div>
-            ) : (
-              <button onClick={() => readExp(false, null)} disabled={readingExp}
-                className="absolute right-3 bottom-3 rounded-full bg-amber-400 px-4 py-2 text-sm font-semibold text-slate-900 shadow-lg active:scale-95 disabled:opacity-80">
-                {readingExp ? '⏳ กำลังอ่าน EXP…' : '📅 อ่าน EXP'}
-              </button>
             )} />
         )}
 
-        {/* EXP / ล็อตที่กำลังนับ: แสดงตลอด แก้ได้ทันที */}
-        <BatchPanel batch={batch} onBatch={onBatch} onTyping={setTyping} lineCount={pallet.lines.length}
-          cameraOn={cameraOn} autoRead={autoRead} onToggleAutoRead={toggleAutoRead}
-          onApplyAll={() => { onChange(setBatchForLines(pallet, () => true, batch)); toast('ใส่ EXP/ล็อตให้ทุกรายการในพาเลทแล้ว') }} />
-
-        {/* ชิ้นล่าสุด */}
-        {last && (
-          <div key={pulse} className={`pop flex items-center gap-3 rounded-2xl bg-white p-3 shadow-sm ring-1 ${last.unknown ? 'ring-red-300' : 'ring-emerald-200'}`}>
-            <div className="min-w-0 flex-1">
-              <div className="text-[11px] text-slate-500">ล่าสุด</div>
-              <div className={`truncate font-semibold ${last.unknown ? 'text-red-600' : 'text-slate-900'}`}>{last.name}</div>
-              <div className="truncate text-xs text-slate-500">{last.unknown ? last.barcode : `${last.itemCode} · ${last.size || '-'}`}</div>
+        {/* ② วันหมดอายุ */}
+        {pending?.step === 'exp' && (
+          <div className="rounded-3xl bg-white p-4 shadow-sm ring-2 ring-amber-300">
+            <WizardTitle no={2} title="วันหมดอายุ (EXP)" item={pending} />
+            <div className="mt-3 rounded-2xl bg-amber-50 px-3 py-2 text-sm text-amber-900">
+              {seek === 'seeking' && '🔍 กำลังอ่าน EXP จากกล้อง… พลิกสินค้าให้กล้องเห็นวันหมดอายุ'}
+              {seek === 'timeout' && (
+                <span className="flex items-center justify-between gap-2">
+                  ยังหาไม่เจอ — พิมพ์เอง หรือกด “ไม่มี EXP”
+                  {cameraOn && (
+                    <button onClick={() => startSeek(pending.id)}
+                      className="shrink-0 rounded-full bg-white px-3 py-1 text-xs font-semibold ring-1 ring-amber-300">ลองอีกครั้ง</button>
+                  )}
+                </span>
+              )}
+              {seek === 'idle' && 'พิมพ์วันหมดอายุ หรือกด “ไม่มี EXP”'}
+              {seek === 'found' && `✅ อ่านได้ “${seekRaw}”`}
             </div>
-            <button onClick={() => onChange(updateLine(pallet, last.key, { qty: last.qty - 1 }))}
-              className="h-11 w-11 rounded-xl bg-slate-100 text-xl font-bold text-slate-600">−</button>
-            <div className="w-14 text-center">
-              <div className="text-2xl leading-none font-bold text-brand-600">{last.qty}</div>
-              <div className="text-[11px] text-slate-500">{UNIT_LABEL[last.unitType]}</div>
+            <div className="mt-3">
+              <DateField value={expText} onChange={setExpText} placeholder="EXP วว/ดด/ปปปป"
+                onFocus={() => { stopSeek(); setSeek('idle') }} />
+              <div className="mt-1 min-h-5 text-sm">
+                {expBad ? <span className="text-red-600">วันที่ยังไม่ครบหรือไม่ถูกต้อง</span> : <ExpiryBadge iso={expIso} />}
+              </div>
             </div>
-            <button onClick={() => onChange(updateLine(pallet, last.key, { qty: last.qty + 1 }))}
-              className="h-11 w-11 rounded-xl bg-brand-50 text-xl font-bold text-brand-600">+</button>
+            <div className="mt-1 flex gap-2">
+              <button onClick={() => goLot(true)} className={`${btnGhost} flex-1`}>ไม่มี EXP</button>
+              <button onClick={() => goLot(false)} disabled={!expIso} className={`${btnPrimary} flex-[2]`}>ถัดไป ›</button>
+            </div>
+            <button onClick={cancelWizard} className="mt-3 w-full text-center text-sm text-slate-400 underline">ยกเลิก (ไม่นับชิ้นนี้)</button>
           </div>
         )}
 
-        {/* พิมพ์บาร์โค้ด / ค้นหาชื่อ */}
-        <form onSubmit={submitManual} className="flex gap-2">
-          <input value={manual} onChange={e => setManual(e.target.value)} placeholder="พิมพ์บาร์โค้ด หรือชื่อสินค้า"
-            className={`${inputClass} bg-white py-2.5`} enterKeyHint="go" />
-          <button className={`${btnPrimary} shrink-0 px-4 py-2.5`}>เพิ่ม</button>
-        </form>
-        {results.length > 0 && (
-          <div className="overflow-hidden rounded-2xl bg-white ring-1 ring-slate-200">
-            {results.map(p => (
-              <button key={p.item_code} onClick={() => { add({ product: p, barcode: p.barcode_piece || p.item_code, unitType: 'piece' }); setResults([]); setManual('') }}
-                className="block w-full border-b border-slate-100 px-4 py-2.5 text-left last:border-0 active:bg-brand-50">
-                <div className="text-sm font-medium">{p.item_name}</div>
-                <div className="text-xs text-slate-500">{p.item_code} · {p.brand} · {p.size}</div>
-              </button>
-            ))}
-          </div>
+        {/* ③ ล็อต (บังคับกรอก) */}
+        {pending?.step === 'lot' && (
+          <form onSubmit={confirmWizard} className="rounded-3xl bg-white p-4 shadow-sm ring-2 ring-brand-400">
+            <WizardTitle no={3} title="ล็อต / Lot no." item={pending} />
+            <button type="button" onClick={() => setPending({ ...pending, step: 'exp' })}
+              className="mt-3 flex w-full items-center justify-between rounded-2xl bg-slate-50 px-3 py-2 text-left text-sm">
+              <span>EXP: <b>{expIso ? formatThaiDate(expIso) : 'ไม่มี EXP'}</b> {expIso && <ExpiryBadge iso={expIso} />}</span>
+              <span className="text-xs text-brand-600">แก้</span>
+            </button>
+            <input value={lotText} onChange={e => setLotText(e.target.value)} placeholder="กรอกเลขล็อต (ต้องใส่)" autoFocus
+              enterKeyHint="done" autoCapitalize="characters" className={`${inputClass} mt-3 text-lg`} />
+            <button type="submit" disabled={!lotText.trim()} className={`${btnPrimary} mt-3 w-full py-4 text-base`}>
+              ✓ บันทึก แล้วสแกนต่อ
+            </button>
+            <button type="button" onClick={cancelWizard} className="mt-3 w-full text-center text-sm text-slate-400 underline">ยกเลิก (ไม่นับชิ้นนี้)</button>
+          </form>
+        )}
+
+        {/* ① สแกน: ชิ้นล่าสุด + พิมพ์บาร์โค้ด */}
+        {!pending && (
+          <>
+            {last && (
+              <div key={pulse} className={`pop rounded-2xl bg-white p-3 shadow-sm ring-1 ${last.unknown ? 'ring-red-300' : 'ring-emerald-200'}`}>
+                <div className="flex items-center gap-3">
+                  <div className="min-w-0 flex-1">
+                    <div className="text-[11px] text-slate-500">ล่าสุด</div>
+                    <div className={`truncate font-semibold ${last.unknown ? 'text-red-600' : 'text-slate-900'}`}>{last.name}</div>
+                    <div className="truncate text-xs text-slate-500">
+                      {last.exp ? `EXP ${formatThaiDate(last.exp)}` : 'ไม่มี EXP'} · ล็อต {last.lot || '-'}
+                    </div>
+                  </div>
+                  <button onClick={() => onChange(updateLine(pallet, last.key, { qty: last.qty - 1 }))}
+                    className="h-11 w-11 rounded-xl bg-slate-100 text-xl font-bold text-slate-600">−</button>
+                  <div className="w-14 text-center">
+                    <div className="text-2xl leading-none font-bold text-brand-600">{last.qty}</div>
+                    <div className="text-[11px] text-slate-500">{UNIT_LABEL[last.unitType]}</div>
+                  </div>
+                  <button onClick={() => onChange(updateLine(pallet, last.key, { qty: last.qty + 1 }))}
+                    className="h-11 w-11 rounded-xl bg-brand-50 text-xl font-bold text-brand-600">+</button>
+                </div>
+                <button onClick={() => newLotFor(last)}
+                  className="mt-2 w-full rounded-xl bg-amber-50 py-2 text-xs font-semibold text-amber-800 ring-1 ring-amber-200">
+                  + สินค้านี้แต่คนละล็อต / EXP
+                </button>
+              </div>
+            )}
+
+            <form onSubmit={submitManual} className="flex gap-2">
+              <input value={manual} onChange={e => setManual(e.target.value)} placeholder="พิมพ์บาร์โค้ด หรือชื่อสินค้า"
+                className={`${inputClass} bg-white py-2.5`} enterKeyHint="go" />
+              <button className={`${btnPrimary} shrink-0 px-4 py-2.5`}>เพิ่ม</button>
+            </form>
+            {results.length > 0 && (
+              <div className="overflow-hidden rounded-2xl bg-white ring-1 ring-slate-200">
+                {results.map(p => (
+                  <button key={p.item_code} onClick={() => pickProduct(p)}
+                    className="block w-full border-b border-slate-100 px-4 py-2.5 text-left last:border-0 active:bg-brand-50">
+                    <div className="text-sm font-medium">{p.item_name}</div>
+                    <div className="text-xs text-slate-500">{p.item_code} · {p.brand} · {p.size}</div>
+                  </button>
+                ))}
+              </div>
+            )}
+          </>
         )}
 
         {/* รายการในพาเลท */}
@@ -263,7 +303,7 @@ export default function PalletScan({ pallet, catalog, batch, onBatch, onChange, 
         </div>
         {pallet.lines.length === 0 ? (
           <div className="rounded-2xl border-2 border-dashed border-slate-200 p-6 text-center text-sm text-slate-400">
-            เริ่มสแกนได้เลย<br />สแกน 1 ครั้ง = นับ 1 ชิ้น/แพ็ค/ลัง ตามบาร์โค้ด
+            เริ่มสแกนได้เลย<br />สินค้าใหม่: สแกน → EXP → ล็อต · สแกนซ้ำ = นับ +1
           </div>
         ) : (
           <div className="overflow-hidden rounded-2xl bg-white ring-1 ring-slate-200">
@@ -272,9 +312,11 @@ export default function PalletScan({ pallet, catalog, batch, onBatch, onChange, 
         )}
       </div>
 
-      <div className="pb-safe fixed inset-x-0 bottom-0 z-20 mx-auto max-w-lg bg-gradient-to-t from-slate-50 via-slate-50 to-slate-50/0 px-3 pt-6">
-        <button onClick={onDone} className={`${btnPrimary} w-full py-4 text-base`}>✓ เสร็จพาเลทนี้</button>
-      </div>
+      {!pending && (
+        <div className="pb-safe fixed inset-x-0 bottom-0 z-20 mx-auto max-w-lg bg-gradient-to-t from-slate-50 via-slate-50 to-slate-50/0 px-3 pt-6">
+          <button onClick={onDone} className={`${btnPrimary} w-full py-4 text-base`}>✓ เสร็จพาเลทนี้</button>
+        </div>
+      )}
 
       <LineSheet line={editing} onClose={() => setEditing(null)}
         onSave={patch => { if (editing) onChange(updateLine(pallet, editing.key, patch)); setEditing(null) }}
@@ -289,6 +331,40 @@ export default function PalletScan({ pallet, catalog, batch, onBatch, onChange, 
         }} />
       <RenameSheet open={renaming} value={pallet.label} onClose={() => setRenaming(false)}
         onSave={label => { onChange({ ...pallet, label }); setRenaming(false) }} />
+    </div>
+  )
+}
+
+const STEP_LABELS = ['สแกนบาร์โค้ด', 'วันหมดอายุ', 'ล็อต']
+
+function Steps({ step }: { step: 1 | 2 | 3 }) {
+  return (
+    <div className="flex gap-1.5 px-4 pb-3">
+      {STEP_LABELS.map((label, i) => {
+        const n = i + 1
+        const state = n < step ? 'done' : n === step ? 'now' : 'next'
+        return (
+          <div key={label} className={`flex flex-1 items-center justify-center gap-1.5 rounded-full py-1 text-xs ${
+            state === 'now' ? 'bg-white font-semibold text-brand-700' : state === 'done' ? 'bg-white/25 text-white' : 'bg-white/10 text-white/60'}`}>
+            <span>{state === 'done' ? '✓' : n}</span>{label}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+function WizardTitle({ no, title, item }: { no: number; title: string; item: ScanItem }) {
+  return (
+    <div>
+      <div className="flex items-center gap-2">
+        <span className="flex h-7 w-7 items-center justify-center rounded-full bg-brand-600 text-sm font-bold text-white">{no}</span>
+        <h3 className="text-lg font-semibold text-slate-900">{title}</h3>
+      </div>
+      <div className={`mt-2 truncate font-medium ${item.product ? 'text-slate-800' : 'text-red-600'}`}>
+        {item.product?.item_name ?? `ไม่พบในระบบ (${item.barcode})`}
+      </div>
+      <div className="text-xs text-slate-500">{item.product?.item_code ?? item.barcode} · {UNIT_LABEL[item.unitType]}</div>
     </div>
   )
 }
@@ -313,102 +389,6 @@ function LineRow({ line, highlight, onClick }: { line: Line; highlight: boolean;
         </div>
       </div>
     </button>
-  )
-}
-
-// EXP / ล็อต ที่จะใช้กับชิ้นที่สแกนต่อจากนี้ (พิมพ์ หรือถ่ายรูปฉลาก) มีผลทันทีที่วันที่ครบ
-function BatchPanel({ batch, onBatch, onTyping, lineCount, onApplyAll, cameraOn, autoRead, onToggleAutoRead }: {
-  batch: Batch
-  onBatch: (b: Batch) => void
-  onTyping: (typing: boolean) => void
-  lineCount: number
-  onApplyAll: () => void
-  cameraOn: boolean
-  autoRead: boolean
-  onToggleAutoRead: () => void
-}) {
-  const [expText, setExpText] = useState(batch.exp ? formatThaiDate(batch.exp) : '')
-  const [syncedExp, setSyncedExp] = useState(batch.exp)
-  const [reading, setReading] = useState(false)
-  const [msg, setMsg] = useState('')
-  const fileRef = useRef<HTMLInputElement>(null)
-
-  // ถ้า EXP ถูกตั้งจากที่อื่น ให้ช่องแสดงตาม
-  if (batch.exp !== syncedExp) {
-    setSyncedExp(batch.exp)
-    if (batch.exp) setExpText(formatThaiDate(batch.exp))
-  }
-
-  const changeExp = (v: string) => {
-    setExpText(v)
-    onBatch({ exp: parseThaiDate(v) ?? '', lot: batch.lot })
-  }
-  const bad = expText !== '' && !parseThaiDate(expText)
-  const active = !!(batch.exp || batch.lot.trim())
-
-  const onPhoto = async (file: File | undefined) => {
-    if (!file) return
-    setReading(true); setMsg('')
-    try {
-      const d = await readLabelDates(file)
-      if (d.exp || d.lot) {
-        if (d.exp) setExpText(formatThaiDate(d.exp))
-        onBatch({ exp: d.exp ?? batch.exp, lot: d.lot ?? batch.lot })
-        setMsg(`✅ อ่านได้: "${d.raw ?? ''}" ตรวจสอบด้วย`)
-      }
-      else if (d.mfg) setMsg(`⚠️ เจอแค่วันผลิต ${formatThaiDate(d.mfg)} ไม่เจอวันหมดอายุ`)
-      else setMsg('⚠️ หาวันที่ไม่เจอ ลองถ่ายใหม่ให้ชัดขึ้น หรือพิมพ์เอง')
-    } catch (err) {
-      setMsg(`❌ ${(err as Error).message}`)
-    } finally {
-      setReading(false)
-      if (fileRef.current) fileRef.current.value = ''
-    }
-  }
-
-  const focus = { onFocus: () => onTyping(true), onBlur: () => onTyping(false) }
-
-  return (
-    <div className={`rounded-2xl p-3 ring-1 ${active ? 'bg-amber-50 ring-amber-200' : 'bg-white ring-slate-200'}`}>
-      <div className="flex items-center justify-between gap-2">
-        <span className="text-xs font-medium text-slate-600">EXP / ล็อต ของชิ้นที่สแกนต่อจากนี้</span>
-        {bad ? <span className="text-xs font-semibold text-red-600">วันที่ยังไม่ครบ</span> : <ExpiryBadge iso={batch.exp} />}
-      </div>
-      <div className="mt-2 flex gap-2">
-        <div className="min-w-0 flex-[3]">
-          <DateField value={expText} onChange={changeExp} placeholder="EXP วว/ดด/ปปปป" {...focus} />
-        </div>
-        <input value={batch.lot} onChange={e => onBatch({ exp: batch.exp, lot: e.target.value })} placeholder="ล็อต"
-          className={`${inputClass} min-w-0 flex-[2]`} {...focus} />
-      </div>
-      <input ref={fileRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={e => onPhoto(e.target.files?.[0])} />
-      <div className="mt-2 flex gap-2">
-        {cameraOn ? (
-          <button onClick={onToggleAutoRead} role="switch" aria-checked={autoRead}
-            className={`flex flex-1 items-center gap-2 rounded-2xl px-3 py-2 text-left text-xs ring-1 ${autoRead ? 'bg-brand-50 text-brand-900 ring-brand-100' : 'bg-white text-slate-500 ring-slate-200'}`}>
-            <span className={`relative h-5 w-9 shrink-0 rounded-full transition ${autoRead ? 'bg-brand-600' : 'bg-slate-300'}`}>
-              <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-all ${autoRead ? 'left-[18px]' : 'left-0.5'}`} />
-            </span>
-            <span>หา EXP/ล็อตอัตโนมัติจากกล้อง<br />เมื่อสแกนเจอสินค้าใหม่ (ไม่ต้องกด)</span>
-          </button>
-        ) : (
-          <button onClick={() => fileRef.current?.click()} disabled={reading} className={`${btnPrimary} flex-1 py-2.5 text-sm`}>
-            {reading ? '⏳ กำลังอ่าน…' : '📷 ถ่ายรูปฉลาก อ่าน EXP'}
-          </button>
-        )}
-        {(active || expText) && (
-          <button onClick={() => { setExpText(''); setMsg(''); onBatch({ exp: '', lot: '' }) }} className={`${btnGhost} px-4 py-2.5 text-sm`}>ล้าง</button>
-        )}
-      </div>
-      {msg && <p className="mt-2 rounded-xl bg-white/70 px-3 py-2 text-xs text-slate-700">{msg}</p>}
-      {active && lineCount > 0 && (
-        <button onClick={() => { if (confirm(`ใส่ EXP/ล็อตนี้ให้ทุกรายการที่สแกนแล้วในพาเลทนี้ (${lineCount} รายการ)?
-รายการสินค้าเดียวกันจะถูกรวมจำนวน`)) onApplyAll() }}
-          className="mt-2 w-full rounded-xl bg-white/70 py-2 text-xs font-medium text-amber-800 ring-1 ring-amber-200">
-          ↺ ใส่ EXP/ล็อตนี้ให้ทุกรายการในพาเลท ({lineCount})
-        </button>
-      )}
-    </div>
   )
 }
 

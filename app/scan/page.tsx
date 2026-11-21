@@ -11,7 +11,7 @@ import { FinishView, RoundView } from '@/components/stock/RoundView'
 import { clearEmployee, getEmployee, type Employee } from '@/lib/auth'
 import { loadCatalog, type Catalog } from '@/lib/catalog'
 import { unlockAudio } from '@/lib/feedback'
-import { loadDraft, newPallet, newRound, saveDraft, type Batch, type Pallet, type Round } from '@/lib/round'
+import { loadDraft, newPallet, newRound, saveDraft, type Pallet, type Round } from '@/lib/round'
 
 type View = 'home' | 'history' | 'expiry' | 'round' | 'pallet' | 'finish'
 
@@ -29,7 +29,6 @@ export default function StockApp() {
   const [round, setRound] = useState<Round | null>(null)
   const [roundSaved, setRoundSaved] = useState(false) // บันทึกลง DB แล้ว ไม่ต้องเก็บร่าง
   const [palletId, setPalletId] = useState<string | null>(null)
-  const [batch, setBatch] = useState<Batch>({ exp: '', lot: '' })
   const [catalog, setCatalog] = useState<Catalog | null>(null)
   const [catalogError, setCatalogError] = useState('')
   const [reloading, setReloading] = useState(false)
@@ -84,7 +83,6 @@ export default function StockApp() {
     const p = newPallet(r)
     setRound({ ...r, pallets: [p] })
     setRoundSaved(false)
-    setBatch({ exp: '', lot: '' })
     setPalletId(p.id)
     go('round')
     go('pallet')
@@ -140,7 +138,7 @@ export default function StockApp() {
             onDiscard={() => { setRound(null); history.go(-1) }} />
         )}
         {view === 'pallet' && pallet && (
-          <PalletScan pallet={pallet} catalog={catalog} batch={batch} onBatch={setBatch}
+          <PalletScan pallet={pallet} catalog={catalog}
             onChange={updatePallet} onDone={back} toast={toast.show} />
         )}
         {view === 'finish' && round && (

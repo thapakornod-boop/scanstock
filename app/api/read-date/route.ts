@@ -1,28 +1,26 @@
-// อ่านวันผลิต / วันหมดอายุจากรูปฉลากสินค้า ด้วย Gemini
+// อ่านวันหมดอายุจากภาพกล้อง/รูปฉลากสินค้า ด้วย Gemini
 // ต้องตั้ง GEMINI_API_KEY ใน .env.local (และใน Environment Variables ตอน deploy)
 
 const MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite'
 const MAX_IMAGE_BASE64 = 4_000_000 // ~3MB หลัง decode
 
-const PROMPT = `This is a photo of a product label or package (often a camera frame taken while scanning a barcode). Find the manufacturing date, the expiry date and the lot/batch number printed on it.
-Labels may say MFG, MFD, PROD, ผลิต, วันผลิต (manufacturing) and EXP, BB, BBE, Best before, Use by, หมดอายุ, ควรบริโภคก่อน (expiry).
+// อ่านเฉพาะวันหมดอายุ (lot ให้ผู้ใช้กรอกเอง) ยิ่งตอบสั้นยิ่งเร็ว
+const PROMPT = `This is a camera frame of a product package. Find the EXPIRY date printed on it.
+Expiry labels: EXP, BB, BBE, Best before, Use by, หมดอายุ, ควรบริโภคก่อน. Ignore manufacturing dates (MFG, MFD, ผลิต).
 Rules:
-- Return dates as yyyy-mm-dd in the Gregorian calendar. Thai Buddhist years (e.g. 2568) must be converted by subtracting 543. A 2-digit year like 68 or 69 is a Buddhist year (2568/2569); 25 or 26 is Gregorian (2025/2026).
+- Return yyyy-mm-dd in the Gregorian calendar. Thai Buddhist years (e.g. 2568) must be converted by subtracting 543. A 2-digit year like 68 or 69 is a Buddhist year (2568/2569); 25 or 26 is Gregorian (2025/2026).
 - Thai/European order is day/month/year unless the label clearly uses another order.
-- If only month and year are printed: use the first day of the month for the manufacturing date and the last day of the month for the expiry date.
-- Use null for any date that is not visible or not readable. Do not guess.
-- lot: the lot / batch number (often after LOT, L, BATCH, B/N, ล็อต, ครั้งที่ผลิต). Return only the code itself, null if none is printed. Never return a date as the lot.
-- raw: the exact date/lot text you read from the label.`
+- If only month and year are printed, use the last day of that month.
+- Use null if no expiry date is visible or readable. Do not guess.
+- raw: the exact expiry text you read.`
 
 const SCHEMA = {
   type: 'OBJECT',
   properties: {
-    mfg: { type: 'STRING', nullable: true },
     exp: { type: 'STRING', nullable: true },
-    lot: { type: 'STRING', nullable: true },
     raw: { type: 'STRING', nullable: true },
   },
-  required: ['mfg', 'exp', 'lot', 'raw'],
+  required: ['exp', 'raw'],
 }
 
 const isIsoDate = (v: unknown): v is string =>
@@ -47,7 +45,7 @@ export async function POST(request: Request) {
     headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
     body: JSON.stringify({
       contents: [{ parts: [{ inline_data: { mime_type: 'image/jpeg', data: image } }, { text: PROMPT }] }],
-      generationConfig: { responseMimeType: 'application/json', responseSchema: SCHEMA, temperature: 0 },
+      generationConfig: { responseMimeType: 'application/json', responseSchema: SCHEMA, temperature: 0, thinkingConfig: { thinkingLevel: 'minimal' } },
     }),
   })
 
@@ -61,13 +59,11 @@ export async function POST(request: Request) {
   // รวมข้อความทุก part (ข้าม part ที่เป็นความคิดของโมเดล)
   const parts: { text?: string; thought?: boolean }[] = data?.candidates?.[0]?.content?.parts ?? []
   const text = parts.filter(p => !p.thought && p.text).map(p => p.text).join('')
-  let parsed: { mfg?: unknown; exp?: unknown; lot?: unknown; raw?: unknown } = {}
+  let parsed: { exp?: unknown; raw?: unknown } = {}
   try { parsed = JSON.parse(text ?? '{}') } catch {}
 
   return Response.json({
-    mfg: isIsoDate(parsed.mfg) ? parsed.mfg : null,
     exp: isIsoDate(parsed.exp) ? parsed.exp : null,
-    lot: typeof parsed.lot === 'string' && parsed.lot.trim() && parsed.lot.trim().length <= 40 ? parsed.lot.trim() : null,
     raw: typeof parsed.raw === 'string' ? parsed.raw : null,
   })
 }

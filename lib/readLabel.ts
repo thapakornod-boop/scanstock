@@ -19,7 +19,7 @@ function resizeToBase64(file: File) {
   })
 }
 
-export type LabelDates = { mfg: string | null; exp: string | null; lot: string | null; raw: string | null }
+export type LabelDates = { exp: string | null; raw: string | null }
 
 export async function readLabelDates(file: File): Promise<LabelDates> {
   return readLabelImage(await resizeToBase64(file))
